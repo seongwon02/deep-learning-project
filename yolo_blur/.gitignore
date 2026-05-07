@@ -3,4 +3,3 @@ __pycache__/
 *.pt
 yolo_result.json
 result_image/
-dataset/
