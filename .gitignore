@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pt
+yolo_result.json
+result_image/
+dataset/
