@@ -1,0 +1,28 @@
+{
+  "identities": [
+    {
+      "id": "synthetic_neutral_01",
+      "prompt": "synthetic non-famous Korean adult face, balanced facial features, natural skin texture",
+      "negative_prompt": "celebrity, famous person, same identity as source",
+      "lora": null,
+      "lora_weight": 0.8,
+      "seed_offset": 11001
+    },
+    {
+      "id": "synthetic_male_01",
+      "prompt": "synthetic non-famous Korean man face, realistic candid portrait, natural skin texture",
+      "negative_prompt": "celebrity, famous person, same identity as source",
+      "lora": null,
+      "lora_weight": 0.75,
+      "seed_offset": 21001
+    },
+    {
+      "id": "synthetic_female_01",
+      "prompt": "synthetic non-famous Korean woman face, realistic candid portrait, natural skin texture",
+      "negative_prompt": "celebrity, famous person, same identity as source",
+      "lora": null,
+      "lora_weight": 0.75,
+      "seed_offset": 31001
+    }
+  ]
+}

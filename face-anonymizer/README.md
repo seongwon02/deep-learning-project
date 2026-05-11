@@ -1,0 +1,305 @@
+# Face Anonymizer Prototype
+
+SDXL inpainting face anonymization prototype for short image/video demos.
+
+The YOLO/tracking side should pass `track_id` and face `bbox` data. This tool turns selected tracks into a soft face mask, keeps chosen IDs untouched, and inpaints only the masked face regions.
+
+Boundary:
+
+```text
+YOLO/tracker: detect faces, assign track_id, write JSON
+SDXL tool: select tracks, build masks/crops, assign synthetic identity, run inpainting, report fallbacks
+```
+
+## Recommended Checkpoint
+
+Default:
+
+```text
+OzzyGT/RealVisXL_V4.0_inpainting
+```
+
+Why this one: it is an SDXL inpainting checkpoint tuned for photorealistic RealVisXL outputs and is available as a Diffusers-compatible Hugging Face model with `openrail++` license metadata.
+
+Fallback:
+
+```text
+diffusers/stable-diffusion-xl-1.0-inpainting-0.1
+```
+
+Use the fallback when you want the most standard SDXL inpainting baseline.
+
+## Install
+
+Use a virtual environment. The first real generation run downloads the SDXL checkpoint into the Hugging Face cache.
+
+```bash
+python3 -m venv .venv-face-anon
+source .venv-face-anon/bin/activate
+pip install -r face-anonymizer/requirements.txt
+```
+
+On Apple Silicon, PyTorch usually uses `mps`. On NVIDIA, it uses `cuda`.
+
+## Detection JSON Contract
+
+Preferred format:
+
+```json
+{
+  "frames": [
+    {
+      "frame_index": 0,
+      "faces": [
+        {
+          "track_id": 1,
+          "bbox": [128, 72, 248, 226],
+          "segmentation": [[128, 100, 150, 76, 222, 78, 248, 104, 236, 214, 188, 226, 140, 214]],
+          "confidence": 0.98
+        },
+        {
+          "track_id": 2,
+          "bbox": [420, 84, 536, 232],
+          "synthetic_id": "synthetic_male_01",
+          "confidence": 0.96
+        }
+      ]
+    }
+  ]
+}
+```
+
+`bbox` defaults to `xyxy`: `[x1, y1, x2, y2]`. `xywh` is also supported with `--bbox-format xywh`.
+
+Mask priority with `--mask-mode auto`:
+
+```text
+segmentation polygon -> landmark convex hull -> bbox ellipse fallback
+```
+
+## Owner Selection / Face Re-ID
+
+YOLO/tracking still owns detection and `track_id` assignment. This tool can now add the "do not anonymize this person" layer with InsightFace embeddings.
+
+First, export source-frame face crops for the web UI:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --owner-crops-dir local/owner_candidates
+```
+
+The command writes crop thumbnails plus `manifest.json`:
+
+```json
+{
+  "source_frame": 0,
+  "faces": [
+    {
+      "face_index": 1,
+      "track_id": "3",
+      "bbox": [120, 80, 220, 210],
+      "crop_path": "frame_000000_face_001_track_3.jpg"
+    }
+  ]
+}
+```
+
+After the user selects a thumbnail, create an owner embedding profile and run anonymization. `--owner-face-index` is zero-based and refers to the `faces[]` entry in that source frame.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --owner-face-index 1 \
+  --owner-profile local/owner_profile.json \
+  --output local/anonymized.mp4 \
+  --report-json local/anonymized_report.json
+```
+
+For later runs, load the saved profile without asking the user again:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --owner-profile local/owner_profile.json \
+  --output local/anonymized.mp4
+```
+
+Per frame, the tool crops each detected face, extracts an InsightFace embedding, compares it with the owner profile by cosine similarity, and dynamically adds matching `track_id`s to the keep set. This lets the owner be recovered even if the tracker changes IDs.
+
+Default owner thresholds:
+
+```text
+similarity >= 0.55  owner vote
+similarity <= 0.35  non-owner vote
+between them        keep previous track state / temporal vote
+```
+
+Useful knobs:
+
+```text
+--owner-high-threshold 0.55
+--owner-low-threshold 0.35
+--owner-vote-window 10
+--owner-min-votes 3
+--owner-hold-frames 12
+--face-recognition-model buffalo_l
+--face-recognition-providers CPUExecutionProvider
+```
+
+The saved owner profile contains a biometric embedding. Keep it local and avoid putting it in logs or shared reports. `--report-json` omits embedding values by default; use `--include-owner-embedding-in-report` only when you deliberately need them.
+
+## Mask Preview
+
+Run this first to verify that the selected tracks and mask shape are correct. It does not load SDXL.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.jpg \
+  --detections face-anonymizer/example_detections.json \
+  --keep-track-ids 1 \
+  --output local/face_preview.jpg \
+  --save-mask local/face_mask.png \
+  --mask-preview
+```
+
+`keep-track-ids` means "do not anonymize these identities." Every other detected face is masked.
+
+## Image Anonymization
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.jpg \
+  --detections detections.json \
+  --keep-track-ids 1 \
+  --output local/anonymized.jpg \
+  --identity-bank face-anonymizer/identity_bank.example.json \
+  --report-json local/anonymized_report.json \
+  --seed 1234
+```
+
+By default, this runs `--inpaint-scope face-crop`. Each selected face is cropped, inpainted at a better SDXL working size, and pasted back. This usually looks better than full-frame inpainting for small faces.
+
+Use one-pass full-frame inpainting when you want all selected faces to be generated together:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.jpg \
+  --detections detections.json \
+  --keep-track-ids 1 \
+  --output local/anonymized.jpg \
+  --inpaint-scope full-frame \
+  --seed 1234
+```
+
+## Short Video Demo
+
+For a very short demo, cap the number of frames first.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --keep-track-ids 1 \
+  --output local/anonymized.mp4 \
+  --identity-bank face-anonymizer/identity_bank.example.json \
+  --max-frames 24 \
+  --report-json local/anonymized_report.json \
+  --seed 1234
+```
+
+The output video currently writes video frames only; audio is not copied.
+
+For short video stability, `--seed-strategy track` is the default. With `--seed 1234`, the same `track_id` gets the same deterministic seed offset across frames.
+
+## ControlNet
+
+ControlNet is optional and should be tested on the Windows GPU machine.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --keep-track-ids 1 \
+  --output local/anonymized_canny.mp4 \
+  --identity-bank face-anonymizer/identity_bank.example.json \
+  --controlnet canny \
+  --controlnet-scale 0.45 \
+  --max-frames 24 \
+  --seed 1234
+```
+
+Use `--controlnet depth` when face volume/pose preservation matters more than edge detail. Canny is lighter and a good first test.
+
+## Synthetic Identity Bank
+
+`--identity-bank` maps anonymized tracks to synthetic identity prompts and optional LoRAs. If a detection has `synthetic_id`, that identity is used. Otherwise, the tool assigns one deterministically from `track_id`.
+
+```json
+{
+  "id": "synthetic_male_01",
+  "prompt": "synthetic non-famous Korean man face, realistic candid portrait",
+  "lora": "local/loras/synthetic_male_01",
+  "lora_weight": 0.75,
+  "seed_offset": 21001
+}
+```
+
+LoRA training notes and Windows wrappers are in `face-anonymizer/LORA_TRAINING.md`.
+
+## Quality Fallbacks
+
+When SDXL fails or barely changes the masked area, the tool can fall back to blur or pixelation and record it.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.jpg \
+  --detections detections.json \
+  --keep-track-ids 1 \
+  --output local/anonymized.jpg \
+  --fallback-mode blur \
+  --report-json local/report.json \
+  --seed 1234
+```
+
+The report includes `track_id`, assigned synthetic identity, mask area ratio, masked mean pixel delta, and fallback reason.
+
+## Useful Options
+
+```text
+--anonymize-track-ids 2,3      Only anonymize these IDs.
+--keep-track-ids 1             Keep these IDs untouched.
+--mask-mode auto               Use polygon, landmark, then ellipse fallback.
+--mask-mode segmentation       Require segmentation polygons unless fallback is enabled.
+--mask-fallback ellipse        Use bbox ellipse when richer mask data is missing.
+--inpaint-scope face-crop      Inpaint each selected face crop separately.
+--inpaint-scope full-frame     Inpaint all selected masks in one full frame pass.
+--crop-expansion 2.4           Context around each face crop.
+--crop-min-size 512            Minimum face crop size before SDXL resizing.
+--mask-expansion 1.35          Expand bbox before drawing the face ellipse.
+--mask-dilation 10             Grow the binary mask before feathering.
+--mask-blur 16                 Feather mask edges for cleaner inpainting.
+--max-side 1024                Resize long side for SDXL work size.
+--scheduler dpmpp_2m_karras    Default photoreal scheduler.
+--seed-strategy track          Stable per-track seed offsets.
+--identity-bank PATH           Synthetic identities and optional LoRAs.
+--controlnet canny|depth       Optional structural guidance.
+--controlnet-scale 0.55        Strength of ControlNet conditioning.
+--fallback-mode blur|pixelate  Safety fallback for failed generations.
+--report-json PATH             Save quality/fallback metrics.
+--owner-crops-dir DIR          Export source-frame crop thumbnails for UI selection.
+--owner-face-index 1           Build owner embedding from selected source-frame face.
+--owner-profile PATH           Save/load owner embedding profile for Re-ID keep logic.
+--owner-high-threshold 0.55    Similarity threshold for owner votes.
+--owner-vote-window 10         Number of recent similarities used per track.
+--model-id MODEL               Override the SDXL inpainting checkpoint.
+--lora PATH_OR_REPO            Optional synthetic identity LoRA.
+--lora-weight 0.8              Blend LoRA strength.
+```
+
+## Next Step
+
+For production-quality masks, have the YOLO/segmentation side emit `segmentation` polygons or `landmarks`. The code will consume them directly and only falls back to bbox ellipses when richer mask data is missing.
