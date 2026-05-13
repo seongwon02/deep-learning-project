@@ -1,0 +1,23 @@
+# Python 캐시
+__pycache__/
+*.py[cod]
+
+# 가상환경
+venv/
+env/
+.env
+
+# 허깅페이스 및 모델 캐시
+.cache/
+models/
+
+# 테스트 생성 결과물 (이미지, 마스크 등)
+*result*.jpg
+*result*.png
+*mask*.jpg
+*control*.jpg
+
+# 비디오 및 GIF 테스트 결과물
+*.mp4
+*.avi
+*.gif
