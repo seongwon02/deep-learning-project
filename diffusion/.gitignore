@@ -10,6 +10,7 @@ env/
 # 허깅페이스 및 모델 캐시
 .cache/
 models/
+.safetensors
 
 # 테스트 생성 결과물 (이미지, 마스크 등)
 *result*.jpg
