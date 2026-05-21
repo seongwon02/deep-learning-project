@@ -1,0 +1,42 @@
+# Python 컴파일 및 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 가상환경 (Virtual Environments)
+venv/
+.venv/
+.venv-face-anon/
+env/
+ENV/
+
+# 개발 툴 및 OS 설정 파일
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# YOLO 모델 가중치 파일 (대용량)
+*.pt
+*.pth
+**/best.pt
+
+# 비디오 및 미디어 파일 (대용량 및 로컬 테스트용)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# 분석 중간 산출물 및 크롭 이미지 폴더
+**/extracted_faces/
+**/face_selection.txt
+**/blur_bboxes_for_diffusion.json
+
+# 학습/검증용 데이터셋 및 YOLO 학습 결과 폴더
+**/dataset/
+**/picture/
+**/result_image/
+**/result_image_trained/
+**/runs/
