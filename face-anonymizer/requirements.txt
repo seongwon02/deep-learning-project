@@ -1,6 +1,7 @@
 accelerate>=0.33.0
 datasets>=2.20.0
 diffusers>=0.30.0
+huggingface_hub>=0.24.0
 insightface>=0.7.3
 numpy>=1.24.0
 onnxruntime>=1.17.0

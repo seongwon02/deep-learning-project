@@ -77,6 +77,18 @@ Mask priority with `--mask-mode auto`:
 segmentation polygon -> landmark convex hull -> bbox ellipse fallback
 ```
 
+For character or animal replacement, the default `auto` mask mode is changed to `bbox` after the reference routes to IP-Adapter. This keeps generation bounded to the YOLO box instead of asking another model to infer the face region. If you explicitly want SAM, use `--mask-mode sam`; the YOLO-side `bbox` is passed to SAM as a box prompt, and the resulting mask is still dilated/blurred by the normal mask knobs:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.jpg \
+  --detections detections.json \
+  --mask-mode sam \
+  --mask-expansion 1.2 \
+  --sam-model-id facebook/sam-vit-base \
+  --output local/anonymized.jpg
+```
+
 ## Owner Selection / Face Re-ID
 
 YOLO/tracking still owns detection and `track_id` assignment. This tool can now add the "do not anonymize this person" layer with InsightFace embeddings.
@@ -151,6 +163,77 @@ Useful knobs:
 ```
 
 The saved owner profile contains a biometric embedding. Keep it local and avoid putting it in logs or shared reports. `--report-json` omits embedding values by default; use `--include-owner-embedding-in-report` only when you deliberately need them.
+
+## Reference Images
+
+There are two levels of reference-image support.
+
+Prompt-only reference extraction is light and safe, but weak for preserving a face:
+
+```bash
+python face-anonymizer/reference_prompt.py \
+  --images refs/synthetic_01.jpg refs/synthetic_02.jpg \
+  --output-json local/reference_prompt.json
+```
+
+Then load it during anonymization:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --reference-prompt-json local/reference_prompt.json \
+  --output local/anonymized.mp4
+```
+
+For stronger preservation, use reference-face conditioning. This feather-blends a synthetic/consented reference face into each target crop before SDXL harmonizes it:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --reference-face-images refs/synthetic_01.jpg refs/synthetic_02.jpg \
+  --strength 0.35 \
+  --output local/anonymized.mp4
+```
+
+Use `--inpaint-scope face-crop` with this mode. Lower `--strength` values, around `0.25` to `0.45`, preserve the reference more; higher values anonymize more aggressively but drift away from the reference. Multiple reference images work best when they are the same synthetic identity under different lighting or angles. Mixing different identities weakens consistency.
+
+For production routing, use `--reference-identity-images`. The tool first asks InsightFace whether the reference contains a valid human face:
+
+```text
+human face detected    -> InstantID route
+no human face detected -> IP-Adapter Plus SDXL route
+```
+
+Human reference example:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --reference-identity-images refs/synthetic_human_01.jpg refs/synthetic_human_02.jpg \
+  --reference-route auto \
+  --instantid-pipeline-dir external/InstantID \
+  --instantid-adapter-path external/InstantID/checkpoints/ip-adapter.bin \
+  --instantid-controlnet-model external/InstantID/checkpoints/ControlNetModel \
+  --reference-face-model-root external/InstantID \
+  --output local/anonymized.mp4
+```
+
+Character or animal reference example:
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --reference-identity-images refs/panda.png refs/panda_side.png \
+  --reference-route auto \
+  --reference-character-prompt "a realistic panda face, natural lighting" \
+  --output local/anonymized.mp4
+```
+
+`auto` uses InsightFace/antelopev2 detection confidence and `--reference-human-min-ratio`. If you already know the reference type, force `--reference-route instantid` or `--reference-route ip-adapter`.
 
 ## Mask Preview
 
@@ -274,12 +357,15 @@ The report includes `track_id`, assigned synthetic identity, mask area ratio, ma
 --keep-track-ids 1             Keep these IDs untouched.
 --mask-mode auto               Use polygon, landmark, then ellipse fallback.
 --mask-mode segmentation       Require segmentation polygons unless fallback is enabled.
+--mask-mode bbox               Use the detection bbox as a rectangular mask.
+--mask-mode sam                Use the detection bbox as a SAM box prompt.
 --mask-fallback ellipse        Use bbox ellipse when richer mask data is missing.
 --inpaint-scope face-crop      Inpaint each selected face crop separately.
 --inpaint-scope full-frame     Inpaint all selected masks in one full frame pass.
 --crop-expansion 2.4           Context around each face crop.
 --crop-min-size 512            Minimum face crop size before SDXL resizing.
 --mask-expansion 1.35          Expand bbox before drawing the face ellipse.
+--sam-local-files-only         Load SAM only from the local Hugging Face cache.
 --mask-dilation 10             Grow the binary mask before feathering.
 --mask-blur 16                 Feather mask edges for cleaner inpainting.
 --max-side 1024                Resize long side for SDXL work size.
@@ -295,6 +381,12 @@ The report includes `track_id`, assigned synthetic identity, mask area ratio, ma
 --owner-profile PATH           Save/load owner embedding profile for Re-ID keep logic.
 --owner-high-threshold 0.55    Similarity threshold for owner votes.
 --owner-vote-window 10         Number of recent similarities used per track.
+--reference-images IMG...      Convert reference image traits into prompt text.
+--reference-face-images IMG... Blend reference face into target crop before inpainting.
+--reference-identity-images IMG... Auto-route references to InstantID or IP-Adapter.
+--reference-route auto          Choose instantid/ip-adapter from InsightFace detection.
+--instantid-pipeline-dir DIR    Directory containing InstantID pipeline_stable_diffusion_xl_instantid.py.
+--ip-adapter-weight-name NAME   SDXL IP-Adapter checkpoint for character/animal references.
 --model-id MODEL               Override the SDXL inpainting checkpoint.
 --lora PATH_OR_REPO            Optional synthetic identity LoRA.
 --lora-weight 0.8              Blend LoRA strength.

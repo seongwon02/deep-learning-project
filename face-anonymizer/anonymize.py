@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
+import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,10 +26,26 @@ from owner_reid import (
     build_owner_profile,
     export_face_crops,
 )
+from reference_face_conditioning import ReferenceFaceBank
+from reference_identity_router import (
+    REFERENCE_ROUTE_INSTANTID,
+    REFERENCE_ROUTE_IP_ADAPTER,
+    InsightFaceReferenceAnalyzer,
+    ReferenceIdentityCondition,
+    draw_landmark_condition,
+    route_reference_identity,
+)
+from reference_prompt import (
+    DEFAULT_CAPTION_MODEL,
+    build_reference_prompt_from_paths,
+    load_reference_prompt,
+    write_reference_prompt,
+)
 
 
 DEFAULT_MODEL_ID = "OzzyGT/RealVisXL_V4.0_inpainting"
 FALLBACK_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+DEFAULT_SAM_MODEL_ID = "facebook/sam-vit-base"
 DEFAULT_PROMPT = (
     "photorealistic face of a synthetic non-famous person, natural skin texture, "
     "realistic eyes, matching head pose, matching lighting, high detail"
@@ -571,16 +589,166 @@ def draw_ellipse_detection(
     return True
 
 
+def draw_bbox_detection(
+    draw: ImageDraw.ImageDraw,
+    detection: FaceDetection,
+    width: int,
+    height: int,
+    mask_expansion: float,
+    mask_y_shift: float,
+) -> bool:
+    box = clamp_bbox(
+        detection.bbox,
+        width=width,
+        height=height,
+        expansion=mask_expansion,
+        y_shift=mask_y_shift,
+    )
+    if box is None:
+        return False
+    draw.rectangle(box, fill=255)
+    return True
+
+
+def load_sam_segmenter(args: argparse.Namespace) -> tuple[Any, Any, str]:
+    if hasattr(args, "_sam_model") and hasattr(args, "_sam_processor") and hasattr(args, "_sam_device"):
+        return args._sam_model, args._sam_processor, args._sam_device
+
+    import torch
+    from transformers import SamModel, SamProcessor
+
+    device = choose_device(args.sam_device)
+    dtype = torch_dtype_for_device(device)
+    model = SamModel.from_pretrained(
+        args.sam_model_id,
+        torch_dtype=dtype,
+        local_files_only=args.sam_local_files_only,
+    )
+    model.to(device)
+    model.eval()
+    processor = SamProcessor.from_pretrained(
+        args.sam_model_id,
+        local_files_only=args.sam_local_files_only,
+    )
+    args._sam_model = model
+    args._sam_processor = processor
+    args._sam_device = device
+    return model, processor, device
+
+
+def draw_sam_detection(
+    binary_mask: Image.Image,
+    source_image: Image.Image | None,
+    detection: FaceDetection,
+    mask_expansion: float,
+    mask_y_shift: float,
+    args: argparse.Namespace | None,
+) -> bool:
+    if source_image is None or args is None:
+        return False
+
+    box = clamp_bbox(
+        detection.bbox,
+        width=source_image.width,
+        height=source_image.height,
+        expansion=mask_expansion,
+        y_shift=mask_y_shift,
+    )
+    if box is None:
+        return False
+
+    import torch
+
+    model, processor, device = load_sam_segmenter(args)
+
+    input_points = None
+    input_labels = None
+
+    if detection.landmarks and len(detection.landmarks) > 0:
+        points = scale_points_to_image(detection.landmarks, source_image.width, source_image.height)
+        input_points = [[[[float(x), float(y)] for x, y in points]]]
+        input_labels = [[[1] * len(points)]]
+    else:
+        x1, y1, x2, y2 = detection.bbox
+        width = x2 - x1
+        height = y2 - y1
+        approx_kps = [
+            (x1 + width * 0.34, y1 + height * 0.38),
+            (x1 + width * 0.66, y1 + height * 0.38),
+            (x1 + width * 0.50, y1 + height * 0.55),
+            (x1 + width * 0.38, y1 + height * 0.74),
+            (x1 + width * 0.62, y1 + height * 0.74),
+        ]
+        input_points = [[[[float(x), float(y)] for x, y in approx_kps]]]
+        input_labels = [[[1] * len(approx_kps)]]
+
+    inputs = processor(
+        source_image.convert("RGB"),
+        input_boxes=[[[float(value) for value in box]]],
+        input_points=input_points,
+        input_labels=input_labels,
+        return_tensors="pt",
+    )
+    dtype = torch_dtype_for_device(device)
+    for k, v in list(inputs.items()):
+        if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+            inputs[k] = v.to(dtype)
+    inputs = inputs.to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs, multimask_output=args.sam_multimask)
+
+    masks = processor.image_processor.post_process_masks(
+        outputs.pred_masks.detach().cpu(),
+        inputs["original_sizes"].detach().cpu(),
+        inputs["reshaped_input_sizes"].detach().cpu(),
+        mask_threshold=args.sam_mask_threshold,
+    )[0]
+    iou_scores = outputs.iou_scores.detach().cpu()[0, 0]
+    mask_index = int(torch.argmax(iou_scores).item()) if args.sam_multimask else 0
+    mask_array = masks[0, mask_index].numpy().astype(np.uint8) * 255
+    if mask_array.max() == 0:
+        return False
+
+    current = np.array(binary_mask, dtype=np.uint8)
+    binary_mask.paste(Image.fromarray(np.maximum(current, mask_array), mode="L"))
+    return True
+
+
 def draw_detection_mask(
     binary_mask: Image.Image,
+    source_image: Image.Image | None,
     detection: FaceDetection,
     mask_mode: str,
     mask_fallback: str,
     mask_expansion: float,
     mask_y_shift: float,
+    args: argparse.Namespace | None = None,
 ) -> bool:
     width, height = binary_mask.size
     draw = ImageDraw.Draw(binary_mask)
+
+    if mask_mode == "sam":
+        drawn = draw_sam_detection(
+            binary_mask=binary_mask,
+            source_image=source_image,
+            detection=detection,
+            mask_expansion=mask_expansion,
+            mask_y_shift=mask_y_shift,
+            args=args,
+        )
+        if drawn:
+            return True
+
+    if mask_mode == "bbox":
+        return draw_bbox_detection(
+            draw,
+            detection,
+            width=width,
+            height=height,
+            mask_expansion=mask_expansion,
+            mask_y_shift=mask_y_shift,
+        )
 
     if mask_mode in {"auto", "segmentation"} and detection.polygons:
         return draw_polygon_detection(draw, detection, width, height)
@@ -605,6 +773,7 @@ def draw_detection_mask(
 
 
 def build_face_mask(
+    image: Image.Image | None,
     image_size: tuple[int, int],
     detections: Iterable[FaceDetection],
     keep_track_ids: set[str],
@@ -616,6 +785,7 @@ def build_face_mask(
     mask_y_shift: float,
     mask_dilation: int,
     mask_blur: int,
+    args: argparse.Namespace | None = None,
 ) -> Image.Image:
     """Build a soft inpainting mask from selected tracked face regions."""
     width, height = image_size
@@ -631,11 +801,13 @@ def build_face_mask(
             continue
         draw_detection_mask(
             binary_mask=binary_mask,
+            source_image=image,
             detection=detection,
             mask_mode=mask_mode,
             mask_fallback=mask_fallback,
             mask_expansion=mask_expansion,
             mask_y_shift=mask_y_shift,
+            args=args,
         )
 
     mask_array = np.array(binary_mask, dtype=np.uint8)
@@ -787,7 +959,7 @@ def inpaint_or_fallback(
         fallback_reason = "mask_too_small"
     else:
         try:
-            result = run_inpaint(pipe, device, image, mask, seed, identity, args)
+            result = run_inpaint(pipe, device, image, mask, seed, identity, detection, args)
         except Exception as exc:
             if args.fallback_mode == "none":
                 raise
@@ -834,6 +1006,14 @@ def write_quality_report(args: argparse.Namespace) -> None:
         "fallback_count": fallback_count,
         "records": records,
     }
+    if args.mask_mode == "sam":
+        payload["sam"] = {
+            "model_id": args.sam_model_id,
+            "device": getattr(args, "_sam_device", args.sam_device),
+            "mask_threshold": args.sam_mask_threshold,
+            "multimask": args.sam_multimask,
+            "local_files_only": args.sam_local_files_only,
+        }
     owner_profile = getattr(args, "_owner_profile", None)
     owner_frames = getattr(args, "_owner_frame_records", [])
     if owner_profile is not None:
@@ -847,6 +1027,36 @@ def write_quality_report(args: argparse.Namespace) -> None:
             "min_votes": args.owner_min_votes,
             "hold_frames": args.owner_hold_frames,
             "frames": owner_frames,
+        }
+    reference_prompt_payload = getattr(args, "_reference_prompt_payload", None)
+    if reference_prompt_payload is not None:
+        payload["reference_prompt"] = {
+            "reference_count": reference_prompt_payload.get("reference_count"),
+            "mode": reference_prompt_payload.get("mode"),
+            "prompt": reference_prompt_payload.get("prompt"),
+            "shared_tags": reference_prompt_payload.get("shared_tags", []),
+            "captions": reference_prompt_payload.get("captions", []),
+            "warnings": reference_prompt_payload.get("warnings", []),
+        }
+    reference_face_bank = getattr(args, "_reference_face_bank", None)
+    if reference_face_bank is not None:
+        payload["reference_face_conditioning"] = {
+            "reference_count": len(reference_face_bank.faces),
+            "crop_mode": reference_face_bank.crop_mode,
+            "target_expansion": reference_face_bank.target_expansion,
+            "feather": reference_face_bank.feather,
+            "opacity": reference_face_bank.opacity,
+        }
+    reference_identity = getattr(args, "_reference_identity_condition", None)
+    if reference_identity is not None:
+        payload["reference_identity_route"] = {
+            "route": reference_identity.route,
+            "reference_count": len(reference_identity.image_paths),
+            "detected_human_faces": len(reference_identity.face_analyses),
+            "human_scores": [round(face.score, 4) for face in reference_identity.face_analyses],
+            "instantid_controlnet_scale": args.instantid_controlnet_scale,
+            "instantid_ip_adapter_scale": args.instantid_ip_adapter_scale,
+            "ip_adapter_scale": args.ip_adapter_scale,
         }
     args.report_json.parent.mkdir(parents=True, exist_ok=True)
     args.report_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -898,17 +1108,131 @@ def apply_scheduler(pipe: Any, scheduler_name: str) -> None:
     raise ValueError(f"Unsupported scheduler: {scheduler_name}")
 
 
+def is_local_path(path: str | None) -> bool:
+    return bool(path) and Path(path).expanduser().exists()
+
+
+def instantid_adapter_path(args: argparse.Namespace) -> str:
+    if args.instantid_adapter_path:
+        return str(args.instantid_adapter_path)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise RuntimeError("InstantID adapter auto-download requires huggingface_hub.") from exc
+    return hf_hub_download(
+        repo_id=args.instantid_repo_id,
+        filename=args.instantid_adapter_filename,
+    )
+
+
+def load_instantid_pipeline(args: argparse.Namespace) -> Any:
+    import torch
+    from diffusers.models import ControlNetModel
+
+    if args.instantid_pipeline_dir:
+        sys.path.insert(0, str(args.instantid_pipeline_dir))
+    try:
+        from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "InstantID route requires the official InstantID "
+            "pipeline_stable_diffusion_xl_instantid.py on PYTHONPATH or --instantid-pipeline-dir."
+        ) from exc
+
+    device = choose_device(args.device)
+    dtype = torch_dtype_for_device(device)
+    controlnet_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+    }
+    controlnet_path = str(args.instantid_controlnet_model)
+    if args.instantid_controlnet_subfolder and not is_local_path(controlnet_path):
+        controlnet_kwargs["subfolder"] = args.instantid_controlnet_subfolder
+    elif args.instantid_controlnet_subfolder and (
+        Path(controlnet_path) / args.instantid_controlnet_subfolder
+    ).exists():
+        controlnet_path = str(Path(controlnet_path) / args.instantid_controlnet_subfolder)
+
+    controlnet = ControlNetModel.from_pretrained(controlnet_path, **controlnet_kwargs)
+    pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
+        args.instantid_base_model,
+        controlnet=controlnet,
+        torch_dtype=dtype,
+    )
+    pipe.load_ip_adapter_instantid(instantid_adapter_path(args))
+    apply_scheduler(pipe, args.scheduler)
+
+    if device == "cuda" and args.cpu_offload:
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to(device)
+    if args.attention_slicing and hasattr(pipe, "enable_attention_slicing"):
+        pipe.enable_attention_slicing()
+    if hasattr(pipe, "enable_vae_tiling"):
+        pipe.enable_vae_tiling()
+    return pipe, device
+
+
+def configure_ip_adapter(pipe: Any, args: argparse.Namespace) -> None:
+    condition = getattr(args, "_reference_identity_condition", None)
+    if condition is None or not condition.is_ip_adapter:
+        return
+    if not hasattr(pipe, "load_ip_adapter"):
+        raise RuntimeError("The active Diffusers pipeline does not support load_ip_adapter().")
+    pipe.load_ip_adapter(
+        args.ip_adapter_model,
+        subfolder=args.ip_adapter_subfolder,
+        weight_name=args.ip_adapter_weight_name,
+    )
+    if hasattr(pipe, "set_ip_adapter_scale"):
+        pipe.set_ip_adapter_scale(args.ip_adapter_scale)
+
+
+def ip_adapter_needs_image_encoder(args: argparse.Namespace) -> bool:
+    weight_name = str(args.ip_adapter_weight_name or "")
+    return "vit-h" in weight_name or "plus" in weight_name
+
+
+def load_ip_adapter_image_encoder(args: argparse.Namespace, dtype: Any) -> Any | None:
+    condition = getattr(args, "_reference_identity_condition", None)
+    if condition is None or not condition.is_ip_adapter:
+        return None
+    if not args.ip_adapter_image_encoder_model and not ip_adapter_needs_image_encoder(args):
+        return None
+    from transformers import CLIPVisionModelWithProjection
+
+    model_id = args.ip_adapter_image_encoder_model or args.ip_adapter_model
+    kwargs: dict[str, Any] = {"torch_dtype": dtype}
+    if args.ip_adapter_image_encoder_subfolder:
+        kwargs["subfolder"] = args.ip_adapter_image_encoder_subfolder
+    return CLIPVisionModelWithProjection.from_pretrained(model_id, **kwargs)
+
+
 def load_pipeline(args: argparse.Namespace) -> Any:
     import torch
     from diffusers import AutoPipelineForInpainting
 
     device = choose_device(args.device)
     dtype = torch_dtype_for_device(device)
+    reference_condition = getattr(args, "_reference_identity_condition", None)
+    if reference_condition is not None and reference_condition.is_instantid:
+        return load_instantid_pipeline(args)
+
+    pipeline_kwargs: dict[str, Any] = {
+        "torch_dtype": dtype,
+        "use_safetensors": True,
+    }
+    if getattr(args, "variant", None) is not None:
+        pipeline_kwargs["variant"] = args.variant
+    elif dtype == torch.float16:
+        pipeline_kwargs["variant"] = "fp16"
+    image_encoder = load_ip_adapter_image_encoder(args, dtype)
+    if image_encoder is not None:
+        pipeline_kwargs["image_encoder"] = image_encoder
+
     if args.controlnet == "none":
         pipe = AutoPipelineForInpainting.from_pretrained(
             args.model_id,
-            torch_dtype=dtype,
-            use_safetensors=True,
+            **pipeline_kwargs,
         )
     else:
         try:
@@ -922,8 +1246,7 @@ def load_pipeline(args: argparse.Namespace) -> Any:
             pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
                 args.model_id,
                 controlnet=controlnet,
-                torch_dtype=dtype,
-                use_safetensors=True,
+                **pipeline_kwargs,
             )
         except Exception:
             if not args.controlnet_fallback:
@@ -932,8 +1255,7 @@ def load_pipeline(args: argparse.Namespace) -> Any:
             args.controlnet = "none"
             pipe = AutoPipelineForInpainting.from_pretrained(
                 args.model_id,
-                torch_dtype=dtype,
-                use_safetensors=True,
+                **pipeline_kwargs,
             )
     apply_scheduler(pipe, args.scheduler)
     if args.lora:
@@ -948,12 +1270,15 @@ def load_pipeline(args: argparse.Namespace) -> Any:
         pipe.load_lora_weights(identity.lora, adapter_name=adapter_name)
         loaded_adapters.add(adapter_name)
 
+    configure_ip_adapter(pipe, args)
+
     if device == "cuda" and args.cpu_offload:
         pipe.enable_model_cpu_offload()
     else:
         pipe.to(device)
 
-    if args.attention_slicing and hasattr(pipe, "enable_attention_slicing"):
+    ip_adapter_active = reference_condition is not None and reference_condition.is_ip_adapter
+    if args.attention_slicing and not ip_adapter_active and hasattr(pipe, "enable_attention_slicing"):
         pipe.enable_attention_slicing()
     return pipe, device
 
@@ -969,8 +1294,49 @@ def apply_identity_adapter(pipe: Any, args: argparse.Namespace, identity: Synthe
 
 
 def prompt_for_identity(args: argparse.Namespace, identity: SyntheticIdentity) -> tuple[str, str]:
-    prompt_parts = [part for part in (identity.prompt, args.prompt) if part]
-    negative_parts = [part for part in (args.negative_prompt, identity.negative_prompt) if part]
+    reference_prompt = getattr(args, "_reference_prompt_text", "")
+    reference_condition = getattr(args, "_reference_identity_condition", None)
+    
+    is_character_route = reference_condition is not None and reference_condition.is_ip_adapter
+    
+    if is_character_route:
+        # For character/animal replacement, exclude human face prompts
+        character_prompt = args.reference_character_prompt
+        
+        # Check if the character prompt or auto-caption contains "panda"
+        is_panda = "panda" in character_prompt.lower()
+        
+        # 1. Expand the character prompt to avoid raccoon-like generations if it's a panda
+        if is_panda:
+            panda_keywords = "black and white giant panda face, black and white fur, white snout, deep black eye patches"
+            if "giant panda" not in character_prompt.lower():
+                character_prompt = f"{character_prompt}, {panda_keywords}"
+                
+        # 2. Append pose, lighting, and quality keywords for character routing to align with target image
+        quality_prompts = "matching head pose, matching lighting, photorealistic, high detail"
+        character_prompt = f"{character_prompt}, {quality_prompts}"
+        
+        # If user explicitly passed a custom prompt, keep it; otherwise ignore the default human prompt
+        user_prompt = args.prompt if args.prompt != DEFAULT_PROMPT else ""
+        prompt_parts = [part for part in (character_prompt, reference_prompt, user_prompt) if part]
+        
+        # 3. Enhance negative prompt for character routing
+        char_neg_parts = []
+        if args.negative_prompt:
+            char_neg_parts.append(args.negative_prompt)
+            
+        # Always exclude human skin/face characteristics to avoid blending with the man's peach skin
+        char_neg_parts.append("human, human face, human skin, skin texture, peach skin")
+        
+        # Exclude raccoon/badger features if it's a panda
+        if is_panda:
+            char_neg_parts.append("raccoon, red panda, brown fur, grey fur, orange fur, badger, brown face, yellow eyes, fox, dog, monkey, cat")
+            
+        negative_parts = [part for part in char_neg_parts if part]
+    else:
+        prompt_parts = [part for part in (identity.prompt, reference_prompt, args.prompt) if part]
+        negative_parts = [part for part in (args.negative_prompt, identity.negative_prompt) if part]
+        
     return ", ".join(prompt_parts), ", ".join(negative_parts)
 
 
@@ -1077,6 +1443,81 @@ def make_control_image(image: Image.Image, args: argparse.Namespace, device: str
     raise ValueError(f"Unsupported controlnet mode: {args.controlnet}")
 
 
+def supports_call_argument(pipe: Any, argument_name: str) -> bool:
+    try:
+        signature = inspect.signature(pipe.__call__)
+    except (TypeError, ValueError):
+        return True
+    return argument_name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def instantid_prompt_for_args(args: argparse.Namespace) -> tuple[str, str]:
+    return args.instantid_prompt, args.instantid_negative_prompt
+
+
+def run_instantid_generate(
+    pipe: Any,
+    device: str,
+    image: Image.Image,
+    mask: Image.Image,
+    seed: int | None,
+    detection: FaceDetection | None,
+    args: argparse.Namespace,
+) -> Image.Image:
+    condition: ReferenceIdentityCondition | None = getattr(args, "_reference_identity_condition", None)
+    if condition is None or condition.face_embedding is None or condition.analyzer is None:
+        raise RuntimeError("InstantID route is active but reference identity conditioning is missing.")
+    if detection is None:
+        keypoints = condition.analyzer.target_keypoints(
+            image,
+            FaceDetection(frame_index=0, track_id=None, bbox=(0, 0, image.width, image.height)),
+            min_confidence=args.reference_target_face_threshold,
+        )
+    else:
+        keypoints = condition.analyzer.target_keypoints(
+            image,
+            detection,
+            min_confidence=args.reference_target_face_threshold,
+        )
+
+    model_image, model_mask = resize_for_model(image, mask, max_side=args.max_side)
+    scale_x = model_image.width / float(image.width)
+    scale_y = model_image.height / float(image.height)
+    model_keypoints = keypoints.copy()
+    model_keypoints[:, 0] *= scale_x
+    model_keypoints[:, 1] *= scale_y
+    condition_image = draw_landmark_condition(model_image.size, model_keypoints)
+    generator = generator_for_seed(seed=seed, device=device)
+    prompt, negative_prompt = instantid_prompt_for_args(args)
+    call_kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "image_embeds": condition.face_embedding,
+        "image": condition_image,
+        "init_image": model_image,
+        "mask_image": model_mask,
+        "controlnet_conditioning_scale": args.instantid_controlnet_scale,
+        "ip_adapter_scale": args.instantid_ip_adapter_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "generator": generator,
+        "height": model_image.height,
+        "width": model_image.width,
+    }
+    call_kwargs = {
+        key: value
+        for key, value in call_kwargs.items()
+        if key in {"prompt", "negative_prompt"} or supports_call_argument(pipe, key)
+    }
+    generated = pipe(**call_kwargs).images[0]
+    if generated.size != image.size:
+        generated = generated.resize(image.size, Image.Resampling.LANCZOS)
+    return composite_inpaint(image, generated, mask)
+
+
 def run_inpaint(
     pipe: Any,
     device: str,
@@ -1084,13 +1525,28 @@ def run_inpaint(
     mask: Image.Image,
     seed: int | None,
     identity: SyntheticIdentity,
+    detection: FaceDetection | None,
     args: argparse.Namespace,
 ) -> Image.Image:
     if np.asarray(mask).max() == 0:
         return image.copy()
 
+    reference_condition = getattr(args, "_reference_identity_condition", None)
+    if reference_condition is not None and reference_condition.is_instantid:
+        return run_instantid_generate(
+            pipe=pipe,
+            device=device,
+            image=image,
+            mask=mask,
+            seed=seed,
+            detection=detection,
+            args=args,
+        )
+
     apply_identity_adapter(pipe, args, identity)
     prompt, negative_prompt = prompt_for_identity(args, identity)
+    print(f"DEBUG PROMPT: {prompt}")
+    print(f"DEBUG NEGATIVE PROMPT: {negative_prompt}")
     model_image, model_mask = resize_for_model(image, mask, max_side=args.max_side)
     generator = generator_for_seed(seed=seed, device=device)
     call_kwargs = {
@@ -1108,6 +1564,10 @@ def run_inpaint(
         call_kwargs["control_image"] = control_image
         call_kwargs["controlnet_conditioning_scale"] = args.controlnet_scale
         call_kwargs["guess_mode"] = args.controlnet_guess_mode
+    if reference_condition is not None and reference_condition.is_ip_adapter:
+        if reference_condition.ip_adapter_image is None:
+            raise RuntimeError("IP-Adapter route is active but no reference image was prepared.")
+        call_kwargs["ip_adapter_image"] = reference_condition.ip_adapter_image
     result = pipe(
         **call_kwargs,
     ).images[0]
@@ -1123,6 +1583,7 @@ def run_full_frame_inpaint(
     args: argparse.Namespace,
 ) -> Image.Image:
     mask = build_face_mask(
+        image=image,
         image_size=image.size,
         detections=detections,
         keep_track_ids=active_keep_track_ids(args),
@@ -1134,6 +1595,7 @@ def run_full_frame_inpaint(
         mask_y_shift=args.mask_y_shift,
         mask_dilation=args.mask_dilation,
         mask_blur=args.mask_blur,
+        args=args,
     )
     identity = choose_identity(None, args.identity_bank_entries, 0)
     seed = seed_for_context(
@@ -1189,7 +1651,16 @@ def run_face_crop_inpaint(
 
         crop = output.crop(crop_box)
         local_detection = shift_detection_to_crop(detection, crop_box)
+        reference_face_bank = getattr(args, "_reference_face_bank", None)
+        if reference_face_bank is not None:
+            crop = reference_face_bank.apply_to_crop(
+                crop=crop,
+                detection=local_detection,
+                track_id=detection.track_id,
+                face_index=face_index,
+            )
         local_mask = build_face_mask(
+            image=crop,
             image_size=crop.size,
             detections=[local_detection],
             keep_track_ids=set(),
@@ -1201,6 +1672,7 @@ def run_face_crop_inpaint(
             mask_y_shift=args.mask_y_shift,
             mask_dilation=args.mask_dilation,
             mask_blur=args.mask_blur,
+            args=args,
         )
         identity = choose_identity(detection, args.identity_bank_entries, face_index)
         seed = seed_for_context(
@@ -1254,6 +1726,7 @@ def process_image(args: argparse.Namespace, detections_by_frame: dict[int, list[
     )
     keep_track_ids = update_owner_keep_ids(args, image, detections, args.frame_index)
     mask = build_face_mask(
+        image=image,
         image_size=image.size,
         detections=detections,
         keep_track_ids=keep_track_ids,
@@ -1265,6 +1738,7 @@ def process_image(args: argparse.Namespace, detections_by_frame: dict[int, list[
         mask_y_shift=args.mask_y_shift,
         mask_dilation=args.mask_dilation,
         mask_blur=args.mask_blur,
+        args=args,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1457,6 +1931,103 @@ def update_owner_keep_ids(
     return keep_track_ids
 
 
+def prepare_reference_prompt(args: argparse.Namespace) -> None:
+    args._reference_prompt_text = ""
+    args._reference_prompt_payload = None
+    if args.reference_images:
+        payload = build_reference_prompt_from_paths(
+            image_paths=args.reference_images,
+            mode=args.reference_prompt_mode,
+            caption_model=args.reference_caption_model,
+            device=args.reference_prompt_device,
+            manual_tags=list(args.reference_manual_tags),
+        )
+        args._reference_prompt_payload = payload
+        args._reference_prompt_text = str(payload["prompt"])
+        if args.reference_prompt_json:
+            write_reference_prompt(payload, args.reference_prompt_json, args.reference_prompt_text_file)
+        elif args.reference_prompt_text_file:
+            write_reference_prompt(payload, None, args.reference_prompt_text_file)
+        return
+
+    if args.reference_prompt_json:
+        payload = load_reference_prompt(args.reference_prompt_json)
+        args._reference_prompt_payload = payload
+        args._reference_prompt_text = str(payload["prompt"])
+
+
+def prepare_reference_face_bank(args: argparse.Namespace) -> None:
+    args._reference_face_bank = None
+    if not args.reference_face_images:
+        return
+    if args.inpaint_scope != "face-crop":
+        warnings.warn(
+            "--reference-face-images is only applied with --inpaint-scope face-crop.",
+            RuntimeWarning,
+        )
+        return
+    args._reference_face_bank = ReferenceFaceBank(
+        image_paths=args.reference_face_images,
+        crop_mode=args.reference_face_crop_mode,
+        target_expansion=args.reference_face_target_expansion,
+        feather=args.reference_face_feather,
+        opacity=args.reference_face_opacity,
+    )
+
+
+def prepare_reference_identity_condition(args: argparse.Namespace) -> None:
+    args._reference_identity_condition = None
+    if not args.reference_identity_images:
+        return
+    if args.inpaint_scope != "face-crop":
+        warnings.warn(
+            "--reference-identity-images is designed for --inpaint-scope face-crop.",
+            RuntimeWarning,
+        )
+    analyzer = InsightFaceReferenceAnalyzer(
+        model_name=args.reference_face_model,
+        model_root=args.reference_face_model_root,
+        providers=args.reference_face_providers or ("CPUExecutionProvider",),
+        det_size=args.reference_face_det_size,
+    )
+    condition = route_reference_identity(
+        image_paths=args.reference_identity_images,
+        route=args.reference_route,
+        analyzer=analyzer,
+        min_confidence=args.reference_human_threshold,
+        human_min_ratio=args.reference_human_min_ratio,
+        ip_adapter_sheet_size=args.ip_adapter_sheet_size,
+        ip_adapter_max_images=args.ip_adapter_max_images,
+    )
+    args._reference_identity_condition = condition
+    args._reference_route = condition.route
+    if condition.is_ip_adapter:
+        default_char_prompt = "a realistic character face matching the reference image, natural lighting, detailed face"
+        if args.reference_character_prompt == default_char_prompt:
+            try:
+                print("Auto-captioning character/animal reference image(s) for prompt generation...")
+                payload = build_reference_prompt_from_paths(
+                    image_paths=args.reference_identity_images,
+                    mode="caption",
+                    caption_model=args.reference_caption_model,
+                    device=args.reference_prompt_device,
+                )
+                if payload.get("captions"):
+                    args.reference_character_prompt = ", ".join(payload["captions"]) + ", natural lighting"
+                else:
+                    args.reference_character_prompt = payload["prompt"]
+                print(f"--> Auto-detected character prompt: {args.reference_character_prompt}")
+            except Exception as e:
+                warnings.warn(f"Failed to auto-caption reference: {e}. Using default character prompt.", RuntimeWarning)
+
+        if args.mask_mode == "auto":
+            args.mask_mode = "bbox"
+        if args.mask_expansion == 1.35:
+            args.mask_expansion = 1.0
+        if args.mask_y_shift == -0.04:
+            args.mask_y_shift = 0.0
+
+
 def process_video(args: argparse.Namespace, detections_by_frame: dict[int, list[FaceDetection]]) -> None:
     capture = cv2.VideoCapture(str(args.input))
     if not capture.isOpened():
@@ -1501,6 +2072,7 @@ def process_video(args: argparse.Namespace, detections_by_frame: dict[int, list[
             )
             keep_track_ids = update_owner_keep_ids(args, image, detections, frame_index)
             mask = build_face_mask(
+                image=image,
                 image_size=image.size,
                 detections=detections,
                 keep_track_ids=keep_track_ids,
@@ -1512,6 +2084,7 @@ def process_video(args: argparse.Namespace, detections_by_frame: dict[int, list[
                 mask_y_shift=args.mask_y_shift,
                 mask_dilation=args.mask_dilation,
                 mask_blur=args.mask_blur,
+                args=args,
             )
             if args.mask_preview:
                 output_image = overlay_mask(image, mask)
@@ -1624,9 +2197,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-index", type=int, default=0, help="Frame index to use for image inputs.")
     parser.add_argument(
         "--mask-mode",
-        choices=("auto", "segmentation", "landmark", "ellipse"),
+        choices=("auto", "segmentation", "landmark", "ellipse", "bbox", "sam"),
         default="auto",
-        help="Prefer segmentation polygons, landmark hulls, or bbox ellipse masks.",
+        help="Prefer segmentation polygons, landmark hulls, bbox ellipse/rectangle masks, or SAM box-prompt masks.",
     )
     parser.add_argument(
         "--mask-fallback",
@@ -1640,7 +2213,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-blur", type=int, default=15)
     parser.add_argument("--mask-preview", action="store_true", help="Save a red mask overlay instead of running SDXL.")
     parser.add_argument("--save-mask", type=Path, help="Optional path for the grayscale inpaint mask.")
+    parser.add_argument("--sam-model-id", default=DEFAULT_SAM_MODEL_ID)
+    parser.add_argument("--sam-device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
+    parser.add_argument("--sam-mask-threshold", type=float, default=0.0)
+    parser.add_argument(
+        "--sam-local-files-only",
+        action="store_true",
+        help="Load the SAM model only from the local Hugging Face cache.",
+    )
+    parser.add_argument(
+        "--sam-multimask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ask SAM for multiple masks and keep the highest-IoU candidate.",
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument("--variant", default=None, help="Diffusers variant (e.g. fp16)")
     parser.add_argument(
         "--scheduler",
         choices=("default", "dpmpp_2m_karras", "euler_a"),
@@ -1661,6 +2249,97 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-estimator-model", default="Intel/dpt-hybrid-midas")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument(
+        "--reference-images",
+        type=Path,
+        nargs="+",
+        help="Reference images to summarize into additional non-identifying prompt traits.",
+    )
+    parser.add_argument(
+        "--reference-prompt-json",
+        type=Path,
+        help="Save a generated reference prompt JSON, or load one when --reference-images is omitted.",
+    )
+    parser.add_argument("--reference-prompt-text-file", type=Path)
+    parser.add_argument(
+        "--reference-prompt-mode",
+        choices=("heuristic", "caption", "auto"),
+        default="heuristic",
+        help="heuristic avoids model downloads; caption uses an image captioning model.",
+    )
+    parser.add_argument("--reference-caption-model", default=DEFAULT_CAPTION_MODEL)
+    parser.add_argument("--reference-prompt-device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--reference-manual-tags",
+        type=parse_csv_tuple,
+        default=(),
+        help="Comma-separated traits to append to the reference prompt.",
+    )
+    parser.add_argument(
+        "--reference-face-images",
+        type=Path,
+        nargs="+",
+        help="Reference face images to feather-blend into each target crop before inpainting.",
+    )
+    parser.add_argument(
+        "--reference-face-crop-mode",
+        choices=("auto", "center", "full"),
+        default="auto",
+        help="How to crop the reference face before fitting it into the target bbox.",
+    )
+    parser.add_argument("--reference-face-target-expansion", type=float, default=1.12)
+    parser.add_argument("--reference-face-feather", type=int, default=18)
+    parser.add_argument("--reference-face-opacity", type=float, default=0.92)
+    parser.add_argument(
+        "--reference-identity-images",
+        type=Path,
+        nargs="+",
+        help="Reference images routed to InstantID for human faces or IP-Adapter for characters/animals.",
+    )
+    parser.add_argument(
+        "--reference-route",
+        choices=("auto", REFERENCE_ROUTE_INSTANTID, REFERENCE_ROUTE_IP_ADAPTER),
+        default="auto",
+        help="auto uses InsightFace detection to choose InstantID or IP-Adapter.",
+    )
+    parser.add_argument("--reference-human-threshold", type=float, default=0.55)
+    parser.add_argument("--reference-human-min-ratio", type=float, default=0.5)
+    parser.add_argument("--reference-target-face-threshold", type=float, default=0.35)
+    parser.add_argument("--reference-face-model", default="antelopev2")
+    parser.add_argument("--reference-face-model-root", type=Path, default=Path("."))
+    parser.add_argument(
+        "--reference-face-providers",
+        type=parse_csv_tuple,
+        default=("CPUExecutionProvider",),
+        help="Comma-separated ONNX Runtime providers for reference routing.",
+    )
+    parser.add_argument("--reference-face-det-size", type=int, default=640)
+    parser.add_argument("--instantid-base-model", default="stabilityai/stable-diffusion-xl-base-1.0")
+    parser.add_argument("--instantid-repo-id", default="InstantX/InstantID")
+    parser.add_argument("--instantid-controlnet-model", default="InstantX/InstantID")
+    parser.add_argument("--instantid-controlnet-subfolder", default="ControlNetModel")
+    parser.add_argument("--instantid-adapter-path", type=Path)
+    parser.add_argument("--instantid-adapter-filename", default="ip-adapter.bin")
+    parser.add_argument("--instantid-pipeline-dir", type=Path)
+    parser.add_argument("--instantid-controlnet-scale", type=float, default=0.8)
+    parser.add_argument("--instantid-ip-adapter-scale", type=float, default=0.8)
+    parser.add_argument("--instantid-prompt", default="a face")
+    parser.add_argument(
+        "--instantid-negative-prompt",
+        default="lowres, bad anatomy, worst quality, low quality, blurry, deformed",
+    )
+    parser.add_argument("--ip-adapter-model", default="h94/IP-Adapter")
+    parser.add_argument("--ip-adapter-subfolder", default="sdxl_models")
+    parser.add_argument("--ip-adapter-weight-name", default="ip-adapter-plus_sdxl_vit-h.safetensors")
+    parser.add_argument("--ip-adapter-image-encoder-model")
+    parser.add_argument("--ip-adapter-image-encoder-subfolder", default="models/image_encoder")
+    parser.add_argument("--ip-adapter-scale", type=float, default=0.75)
+    parser.add_argument("--ip-adapter-sheet-size", type=int, default=512)
+    parser.add_argument("--ip-adapter-max-images", type=int, default=4)
+    parser.add_argument(
+        "--reference-character-prompt",
+        default="a realistic character face matching the reference image, natural lighting, detailed face",
+    )
     parser.add_argument("--identity-bank", type=Path, help="JSON bank of synthetic identities and optional LoRAs.")
     parser.add_argument("--lora", help="Optional synthetic identity LoRA path or Hugging Face repo.")
     parser.add_argument("--lora-adapter-name", default="synthetic_identity")
@@ -1720,6 +2399,9 @@ def main() -> None:
         return
     if args.output is None:
         raise ValueError("--output is required unless you are only exporting --owner-crops-dir.")
+    prepare_reference_prompt(args)
+    prepare_reference_face_bank(args)
+    prepare_reference_identity_condition(args)
     prepare_owner_matcher(args, detections_by_frame, kind)
     if kind == "image":
         process_image(args, detections_by_frame)
