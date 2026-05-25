@@ -173,8 +173,12 @@ def get_first_frame(path: str) -> Image.Image | None:
 
 
 def run_pipeline(input_path, det_path, keep_ids, output_path,
-                 fallback, seed, max_frames, mask_preview, mask_mode, inpaint_scope) -> tuple[bool, str]:
-    script = Path(__file__).parent / "face-anonymizer" / "anonymize.py"
+                 fallback, seed, max_frames, mask_preview, mask_mode, inpaint_scope, sticker_anonymize) -> tuple[bool, str]:
+    if sticker_anonymize:
+        script = Path(__file__).parent / "face-anonymizer" / "sticker_mode" / "anonymize.py"
+    else:
+        script = Path(__file__).parent / "face-anonymizer" / "anonymize.py"
+
     cmd = [
         sys.executable, str(script),
         "--input", input_path,
@@ -191,6 +195,8 @@ def run_pipeline(input_path, det_path, keep_ids, output_path,
         cmd += ["--max-frames", str(max_frames)]
     if mask_preview:
         cmd += ["--mask-preview"]
+    if sticker_anonymize:
+        cmd += ["--sticker-anonymize"]
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(script.parent) + os.pathsep + env.get("PYTHONPATH", "")
@@ -237,6 +243,7 @@ with st.sidebar:
     seed       = st.number_input("랜덤 시드", value=1234, min_value=0)
     max_frames = st.number_input("최대 프레임 (영상, 0=전체)", value=24, min_value=0)
     mask_only  = st.checkbox("마스크 미리보기만 (Diffusion 생략)")
+    sticker_anonymize = st.checkbox("Fast Sticker 모드 (비식별화 고속화)", value=True, help="얼굴 ID별로 처음 등장할 때만 Diffusion을 수행하고, 이후 프레임은 생성이 아닌 스티커 합성 방식을 적용하여 초고속으로 처리합니다. 동영상 비식별화의 연산 속도를 대폭 줄일 수 있습니다.")
 
     st.divider()
     if st.button("초기화"):
@@ -380,6 +387,7 @@ if dets and preview:
                     st.session_state.keep_ids, out,
                     fallback, int(seed), int(max_frames),
                     mask_only, mask_mode, inpaint_scope,
+                    sticker_anonymize,
                 )
 
             if ok:
