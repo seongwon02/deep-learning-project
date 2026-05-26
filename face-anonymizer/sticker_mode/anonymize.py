@@ -274,11 +274,14 @@ def load_detections(path: Path, bbox_format: str) -> dict[int, list[FaceDetectio
         return by_frame
 
     if isinstance(payload, dict):
-        for frame_index, faces in payload.items():
+        for frame_index_str, faces in payload.items():
             if not isinstance(faces, list):
                 continue
+            # Robustly extract numbers (e.g., 'frame_0' -> 0)
+            clean_key = "".join(c for c in str(frame_index_str) if c.isdigit())
+            fidx = int(clean_key) if clean_key else 0
             for raw in faces:
-                add_detection(int(frame_index), raw)
+                add_detection(fidx, raw)
         return by_frame
 
     if isinstance(payload, list):
