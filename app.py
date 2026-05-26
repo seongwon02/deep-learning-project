@@ -232,6 +232,7 @@ def run_pipeline(input_path, det_path, keep_ids, output_path,
         "--seed", str(seed),
         "--mask-mode", mask_mode,
         "--inpaint-scope", inpaint_scope,
+        "--variant", "fp16",
     ]
     if keep_ids:
         cmd += ["--keep-track-ids", ",".join(sorted(keep_ids))]
@@ -551,7 +552,7 @@ with col_right:
                 st.rerun()
             else:
                 st.error("❌ 비식별화 처리 도중 오류가 발생했습니다.")
-                st.code(log[:2000])
+                st.code(log)
 
     # 결과 디스플레이
     out_path = st.session_state.get("output_path")
