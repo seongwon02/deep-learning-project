@@ -55,6 +55,23 @@ DEFAULT_NEGATIVE_PROMPT = (
     "plastic skin, deformed face, asymmetrical eyes, bad anatomy, mask artifact, "
     "uncanny, blurry"
 )
+DEFAULT_PRIVACY_NEGATIVE_PROMPT = (
+    "realistic human face, photorealistic human skin, human identity, "
+    "recognizable person, celebrity likeness, real person, face swap, deepfake, "
+    "accurate human facial features"
+)
+DEFAULT_FIRE_PROMPT = (
+    "the entire head and masked face area is replaced by a roaring supernatural fireball, "
+    "no face visible, no facial features, opaque cinematic realistic flames, blazing fire texture, "
+    "swirling orange flames, glowing embers, overlapping fire wisps, dark smoke, "
+    "faceless anonymization VFX, warm fire lighting reflecting on hair and shoulders, "
+    "high-resolution visual effects"
+)
+DEFAULT_FIRE_NEGATIVE_PROMPT = (
+    "human face, realistic human face, photorealistic human skin, skin texture, "
+    "recognizable person, eyes, nose, mouth, lips, teeth, facial features, "
+    "face swap, deepfake, celebrity likeness, still face, portrait face, text, watermark"
+)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 MAX_TORCH_SEED = 2**32 - 1
@@ -849,6 +866,35 @@ def resize_for_model(
     )
 
 
+def fire_prepaint_image(
+    image: Image.Image,
+    mask: Image.Image,
+    args: argparse.Namespace,
+    detection: FaceDetection | None = None,
+) -> Image.Image:
+    if args.replacement_preset != "fire" or args.fire_prepaint == "none":
+        return image
+    fill_colors = {
+        "white": (255, 255, 255),
+        "black": (0, 0, 0),
+        "gray": (128, 128, 128),
+    }
+    fill = Image.new("RGB", image.size, fill_colors[args.fire_prepaint])
+    prepaint_mask = mask
+    if args.fire_prepaint_region == "bbox" and detection is not None:
+        box = clamp_bbox(
+            detection.bbox,
+            width=image.width,
+            height=image.height,
+            expansion=args.fire_prepaint_bbox_expansion,
+            y_shift=0.0,
+        )
+        if box is not None:
+            prepaint_mask = Image.new("L", image.size, 0)
+            ImageDraw.Draw(prepaint_mask).rectangle(box, fill=255)
+    return Image.composite(fill, image.convert("RGB"), prepaint_mask)
+
+
 def composite_inpaint(original: Image.Image, generated: Image.Image, mask: Image.Image) -> Image.Image:
     if generated.size != original.size:
         generated = generated.resize(original.size, Image.Resampling.LANCZOS)
@@ -999,6 +1045,7 @@ def write_quality_report(args: argparse.Namespace) -> None:
         "input": str(args.input),
         "output": str(args.output) if args.output else None,
         "model_id": args.model_id,
+        "replacement_preset": args.replacement_preset,
         "controlnet": args.controlnet,
         "inpaint_scope": args.inpaint_scope,
         "mask_mode": args.mask_mode,
@@ -1057,6 +1104,13 @@ def write_quality_report(args: argparse.Namespace) -> None:
             "instantid_controlnet_scale": args.instantid_controlnet_scale,
             "instantid_ip_adapter_scale": args.instantid_ip_adapter_scale,
             "ip_adapter_scale": args.ip_adapter_scale,
+        }
+    if args.replacement_preset == "fire":
+        payload["fire"] = {
+            "prepaint": args.fire_prepaint,
+            "prepaint_region": args.fire_prepaint_region,
+            "prepaint_bbox_expansion": args.fire_prepaint_bbox_expansion,
+            "force_bbox": args.fire_force_bbox,
         }
     args.report_json.parent.mkdir(parents=True, exist_ok=True)
     args.report_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1296,9 +1350,24 @@ def apply_identity_adapter(pipe: Any, args: argparse.Namespace, identity: Synthe
 def prompt_for_identity(args: argparse.Namespace, identity: SyntheticIdentity) -> tuple[str, str]:
     reference_prompt = getattr(args, "_reference_prompt_text", "")
     reference_condition = getattr(args, "_reference_identity_condition", None)
-    
+
+    if args.replacement_preset == "fire":
+        user_prompt = args.prompt if args.prompt != DEFAULT_PROMPT else ""
+        prompt_parts = [part for part in (args.fire_prompt, reference_prompt, user_prompt) if part]
+        negative_parts = [
+            part
+            for part in (
+                DEFAULT_PRIVACY_NEGATIVE_PROMPT,
+                args.fire_negative_prompt,
+                args.negative_prompt,
+                identity.negative_prompt,
+            )
+            if part
+        ]
+        return ", ".join(prompt_parts), ", ".join(negative_parts)
+
     is_character_route = reference_condition is not None and reference_condition.is_ip_adapter
-    
+
     if is_character_route:
         # For character/animal replacement, exclude human face prompts
         character_prompt = args.reference_character_prompt
@@ -1327,6 +1396,7 @@ def prompt_for_identity(args: argparse.Namespace, identity: SyntheticIdentity) -
             
         # Always exclude human skin/face characteristics to avoid blending with the man's peach skin
         char_neg_parts.append("human, human face, human skin, skin texture, peach skin")
+        char_neg_parts.append(DEFAULT_PRIVACY_NEGATIVE_PROMPT)
         
         # Exclude raccoon/badger features if it's a panda
         if is_panda:
@@ -1547,7 +1617,8 @@ def run_inpaint(
     prompt, negative_prompt = prompt_for_identity(args, identity)
     print(f"DEBUG PROMPT: {prompt}")
     print(f"DEBUG NEGATIVE PROMPT: {negative_prompt}")
-    model_image, model_mask = resize_for_model(image, mask, max_side=args.max_side)
+    inpaint_source = fire_prepaint_image(image, mask, args, detection=detection)
+    model_image, model_mask = resize_for_model(inpaint_source, mask, max_side=args.max_side)
     generator = generator_for_seed(seed=seed, device=device)
     call_kwargs = {
         "prompt": prompt,
@@ -1692,7 +1763,7 @@ def run_face_crop_inpaint(
             seed=seed,
             identity=identity,
             frame_index=frame_index,
-            detection=detection,
+            detection=local_detection,
             face_index=face_index,
             crop_box=crop_box,
             args=args,
@@ -2028,6 +2099,25 @@ def prepare_reference_identity_condition(args: argparse.Namespace) -> None:
             args.mask_y_shift = 0.0
 
 
+def prepare_replacement_preset(args: argparse.Namespace) -> None:
+    if args.replacement_preset != "fire":
+        return
+    if args.fire_force_bbox and args.mask_mode == "auto":
+        args.mask_mode = "bbox"
+    if args.fire_force_bbox and args.mask_expansion == 1.35:
+        args.mask_expansion = 1.08
+    if args.fire_force_bbox and args.mask_y_shift == -0.04:
+        args.mask_y_shift = 0.0
+    if args.mask_dilation == 9:
+        args.mask_dilation = 20
+    if args.mask_blur == 15:
+        args.mask_blur = 20
+    if args.strength == 0.98:
+        args.strength = 1.0
+    if args.guidance_scale == 5.0:
+        args.guidance_scale = 6.0
+
+
 def process_video(args: argparse.Namespace, detections_by_frame: dict[int, list[FaceDetection]]) -> None:
     capture = cv2.VideoCapture(str(args.input))
     if not capture.isOpened():
@@ -2250,6 +2340,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument(
+        "--replacement-preset",
+        choices=("none", "fire"),
+        default="none",
+        help="Use a non-identity anonymization preset. fire covers the masked area with flames/smoke.",
+    )
+    parser.add_argument("--fire-prompt", default=DEFAULT_FIRE_PROMPT)
+    parser.add_argument("--fire-negative-prompt", default=DEFAULT_FIRE_NEGATIVE_PROMPT)
+    parser.add_argument(
+        "--fire-prepaint",
+        choices=("none", "white", "black", "gray"),
+        default="white",
+        help="Fill the masked input area before diffusion so the model does not reconstruct the original face.",
+    )
+    parser.add_argument(
+        "--fire-prepaint-region",
+        choices=("bbox", "mask"),
+        default="bbox",
+        help="Use the raw detection bbox or the final diffusion mask for the fire prepaint fill.",
+    )
+    parser.add_argument(
+        "--fire-prepaint-bbox-expansion",
+        type=float,
+        default=1.0,
+        help="Expansion for bbox-only fire prepaint. Keep at 1.0 to blank only the original bbox.",
+    )
+    parser.add_argument(
+        "--fire-force-bbox",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --replacement-preset fire is active, make auto masks use the detection bbox.",
+    )
+    parser.add_argument(
         "--reference-images",
         type=Path,
         nargs="+",
@@ -2402,6 +2524,7 @@ def main() -> None:
     prepare_reference_prompt(args)
     prepare_reference_face_bank(args)
     prepare_reference_identity_condition(args)
+    prepare_replacement_preset(args)
     prepare_owner_matcher(args, detections_by_frame, kind)
     if kind == "image":
         process_image(args, detections_by_frame)

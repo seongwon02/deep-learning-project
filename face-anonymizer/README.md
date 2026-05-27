@@ -235,6 +235,35 @@ python face-anonymizer/anonymize.py \
 
 `auto` uses InsightFace/antelopev2 detection confidence and `--reference-human-min-ratio`. If you already know the reference type, force `--reference-route instantid` or `--reference-route ip-adapter`.
 
+## Fire Anonymization Preset
+
+For video, a flame/smoke replacement can hide diffusion flicker because real fire already changes shape frame to frame. The preset keeps the anonymization non-human by fixing the positive prompt to an opaque VFX fire mask and adding safety negatives for human likeness, face swap, deepfake, and recognizable-person cues.
+
+```bash
+python face-anonymizer/anonymize.py \
+  --input input.mp4 \
+  --detections detections.json \
+  --output local/fire_anonymized.mp4 \
+  --replacement-preset fire \
+  --mask-mode bbox \
+  --seed 1234 \
+  --seed-strategy track \
+  --strength 1.0 \
+  --guidance-scale 6.0 \
+  --num-inference-steps 12 \
+  --report-json local/fire_report.json
+```
+
+With `--replacement-preset fire`, `--mask-mode auto` is forced to `bbox` by default. This keeps the flame mass locked to the YOLO/tracker box while letting the flame detail flicker naturally. The preset also widens and feathers the mask slightly so warm fire light can bleed into nearby hair and shoulders.
+
+The preset also uses `--fire-prepaint white --fire-prepaint-region bbox` by default. Before diffusion, the original detection bbox is filled with a plain white patch, while the diffusion mask can be slightly larger, for example `--mask-expansion 1.1`. This reduces the model's tendency to reconstruct the original face without creating a large white halo around the feathered mask. You can disable it with `--fire-prepaint none`.
+
+For desktop GPU experiments, weak structure guidance can help keep the effect inside the face area:
+
+```bash
+--controlnet canny --controlnet-scale 0.45
+```
+
 ## Mask Preview
 
 Run this first to verify that the selected tracks and mask shape are correct. It does not load SDXL.
@@ -374,6 +403,10 @@ The report includes `track_id`, assigned synthetic identity, mask area ratio, ma
 --identity-bank PATH           Synthetic identities and optional LoRAs.
 --controlnet canny|depth       Optional structural guidance.
 --controlnet-scale 0.55        Strength of ControlNet conditioning.
+--replacement-preset fire      Cover masked faces with flame/smoke VFX.
+--fire-prepaint white          Blank the masked input area before fire generation.
+--fire-prepaint-region bbox    Prepaint only the raw bbox, not the blurred mask.
+--fire-force-bbox              Make fire preset auto masks use the bbox.
 --fallback-mode blur|pixelate  Safety fallback for failed generations.
 --report-json PATH             Save quality/fallback metrics.
 --owner-crops-dir DIR          Export source-frame crop thumbnails for UI selection.
