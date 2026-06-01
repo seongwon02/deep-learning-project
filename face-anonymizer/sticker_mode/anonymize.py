@@ -892,6 +892,19 @@ def masked_mean_abs_delta(before: Image.Image, after: Image.Image, mask: Image.I
     return float(delta[mask_array].mean())
 
 
+_STICKER_IMAGE_PATH = Path(__file__).parent / "Subject.png"
+_STICKER_IMAGE_CACHE: Image.Image | None = None
+
+
+def _load_sticker_image() -> Image.Image:
+    global _STICKER_IMAGE_CACHE
+    if _STICKER_IMAGE_CACHE is None:
+        _STICKER_IMAGE_CACHE = Image.open(_STICKER_IMAGE_PATH).convert("RGBA")
+    return _STICKER_IMAGE_CACHE
+
+
+
+
 def fallback_anonymize(image: Image.Image, mask: Image.Image, args: argparse.Namespace) -> Image.Image:
     if args.fallback_mode == "none":
         return image
@@ -1677,7 +1690,16 @@ def run_face_crop_inpaint(
             args=args,
         )
 
-        if use_sticker:
+        if getattr(args, "sticker_anonymize", False):
+            # Simple sticker mode: overlay Subject.png using its alpha × face mask
+            sticker_rgba = _load_sticker_image().resize(crop.size, Image.Resampling.LANCZOS)
+            sticker_alpha_arr = np.asarray(sticker_rgba.split()[3], dtype=np.float32) / 255.0
+            face_mask_arr = np.asarray(local_mask, dtype=np.float32) / 255.0
+            combined_mask = Image.fromarray(
+                (sticker_alpha_arr * face_mask_arr * 255).clip(0, 255).astype(np.uint8), mode="L"
+            )
+            inpainted_crop = composite_inpaint(crop, sticker_rgba.convert("RGB"), combined_mask)
+        elif use_sticker:
             sticker_crop = args._sticker_cache[track_id]
             resized_sticker = sticker_crop.resize(crop.size, Image.Resampling.LANCZOS)
             inpainted_crop = composite_inpaint(crop, resized_sticker, local_mask)
@@ -1713,8 +1735,6 @@ def run_face_crop_inpaint(
                 crop_box=crop_box,
                 args=args,
             )
-            if getattr(args, "sticker_anonymize", False) and track_id is not None:
-                args._sticker_cache[track_id] = inpainted_crop
 
         output.paste(inpainted_crop, crop_box)
 
@@ -1769,7 +1789,12 @@ def process_image(args: argparse.Namespace, detections_by_frame: dict[int, list[
         overlay_mask(image, mask).save(args.output)
         return
 
-    pipe, device = load_pipeline(args)
+    if getattr(args, "sticker_anonymize", False):
+        pipe, device = None, "cpu"
+        if not hasattr(args, "_sticker_cache"):
+            args._sticker_cache = {}
+    else:
+        pipe, device = load_pipeline(args)
     if args.inpaint_scope == "face-crop":
         output = run_face_crop_inpaint(pipe, device, image, detections, args.frame_index, args)
     else:
@@ -2112,23 +2137,8 @@ def process_video(args: argparse.Namespace, detections_by_frame: dict[int, list[
             if args.mask_preview:
                 output_image = overlay_mask(image, mask)
             else:
-                need_diffusion = False
-                if args.sticker_anonymize:
-                    targets = selected_detections(
-                        detections,
-                        keep_track_ids=active_keep_track_ids(args),
-                        anonymize_track_ids=args.anonymize_track_ids,
-                        anonymize_untracked=args.anonymize_untracked,
-                    )
-                    for det in targets:
-                        if det.track_id is None or det.track_id not in args._sticker_cache:
-                            need_diffusion = True
-                            break
-                else:
-                    need_diffusion = True
-
-                if need_diffusion and args._pipe is None:
-                    print("Loading diffusion pipeline for new face track anonymization...")
+                if not args.sticker_anonymize and args._pipe is None:
+                    print("Loading diffusion pipeline...")
                     args._pipe, args._device = load_pipeline(args)
 
                 if args.inpaint_scope == "face-crop":
