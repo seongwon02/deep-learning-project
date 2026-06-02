@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -177,7 +178,7 @@ def run_auto_yolo_detection(media_path: str) -> dict:
     # yolo_blur/yolo_11_L/best.pt 가 있다면 사용, 없으면 yolov8n-face.pt (자동 다운로드)
     model_path = Path(__file__).parent / "yolo_blur" / "yolo_11_L" / "best.pt"
     if not model_path.exists():
-        model_path = "yolov8n.pt"
+        model_path = "yolov8n-face.pt"
         
     model = YOLO(str(model_path))
     cap = cv2.VideoCapture(media_path)
@@ -253,11 +254,11 @@ def run_pipeline(input_path, det_path, keep_ids, output_path,
     env = os.environ.copy()
     env["PYTHONPATH"] = str(script.parent) + os.pathsep + env.get("PYTHONPATH", "")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600,
                            env=env, cwd=str(script.parent))
         return (True, r.stdout) if r.returncode == 0 else (False, r.stderr)
     except subprocess.TimeoutExpired:
-        return False, "타임아웃 (10분 초과)"
+        return False, "타임아웃 (60분 초과)"
     except Exception as e:
         return False, str(e)
 
