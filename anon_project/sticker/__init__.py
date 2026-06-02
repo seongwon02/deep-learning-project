@@ -1,0 +1,1 @@
+from .processor import apply_sticker_anonymization
