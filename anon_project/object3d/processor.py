@@ -249,10 +249,14 @@ def apply_3d_anonymization(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # Try AVC1 (H.264) first for browser playback support, fallback to mp4v
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
     if not writer.isOpened():
-        raise IOError(f"Could not create output video writer: {output_path}")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise IOError(f"Could not create output video writer: {output_path}")
         
     light_dir = np.array([0.3, 0.3, 0.9], dtype=np.float32)
     light_dir /= np.linalg.norm(light_dir)

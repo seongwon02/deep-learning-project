@@ -233,6 +233,33 @@ STYLE_PRESETS: dict[str, StylePreset] = {
         num_inference_steps=30,
         mask_expansion=1.65,
         mask_dilation=14,
+     ),
+    # ---- 2d_animation ----
+    "2d_animation": StylePreset(
+        name="2d_animation",
+        prompt=(
+            "beautiful 2D anime style digital painting, masterpiece, highly detailed face, "
+            "vibrant colors, clean lineart, anime aesthetic, stylized illustration, "
+            "matching head pose, matching scene lighting, high detail"
+        ),
+        negative_prompt=(
+            "photorealistic, 3d render, photograph, real skin texture, bad anatomy, "
+            "deformed face, blurry, low quality, watermark, text"
+        ),
+        privacy_negative_prompt=(
+            "realistic human face, human skin, human eyes, human nose, human mouth, "
+            "human lips, human teeth, visible face, facial features, skin texture, "
+            "face identity, recognizable person, celebrity likeness, real person, "
+            "face swap, deepfake, portrait photography"
+        ),
+        controlnet="none",
+        controlnet_scale=0.55,
+        ip_adapter_scale=0.75,
+        strength=0.98,
+        guidance_scale=5.0,
+        num_inference_steps=28,
+        mask_expansion=1.35,
+        mask_dilation=9,
     ),
 }
 

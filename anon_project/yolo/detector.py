@@ -28,11 +28,17 @@ def run_tracking(
         # Search relative to workspace or project root
         curr_dir = Path(__file__).parent.resolve()
         possible_paths = [
-            curr_dir.parent / "face_yolov8n.pt",                # real/anon_project/face_yolov8n.pt
-            curr_dir.parent.parent / "real" / "face_yolov8n.pt", # real/face_yolov8n.pt
-            curr_dir.parent.parent / "face_yolov8n.pt",         # face_yolov8n.pt
-            curr_dir.parent.parent / "yolo11l.pt",               # yolo11l.pt
-            "yolov8n.pt"                                        # fallback
+            curr_dir.parent / "face_yolov8l.pt",
+            curr_dir.parent / "yolov8l-face.pt",
+            curr_dir.parent / "face_yolov8n.pt",
+            curr_dir.parent.parent / "real" / "face_yolov8l.pt",
+            curr_dir.parent.parent / "real" / "yolov8l-face.pt",
+            curr_dir.parent.parent / "real" / "face_yolov8n.pt",
+            curr_dir.parent.parent / "face_yolov8l.pt",
+            curr_dir.parent.parent / "yolov8l-face.pt",
+            curr_dir.parent.parent / "face_yolov8n.pt",
+            curr_dir.parent.parent / "yolo11l.pt",
+            "yolov8n.pt"
         ]
         for p in possible_paths:
             if isinstance(p, Path) and p.exists():

@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +24,8 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
 
 # Ensure the parent directory of anon_project is in sys.path to resolve imports correctly
-# If we run this app from real/anon_project/app.py, the project root is Path(__file__).parent.parent
-project_root = Path(__file__).parent.parent.resolve()
+# We first resolve the absolute path of app.py, then get its grandparent directory (real/)
+project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -257,14 +258,58 @@ def get_first_frame(path: str) -> Image.Image | None:
     cap.release()
     return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) if ok else None
 
+def ensure_h264_video(file_path: str):
+    import subprocess
+    import shutil
+    path = Path(file_path)
+    if not path.exists():
+        return
+    if path.suffix.lower() not in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+        return
+    try:
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        return
+    
+    temp_out = path.parent / f"temp_h264_{path.name}"
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-i", str(path),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "23",
+        "-preset", "medium",
+        str(temp_out)
+    ]
+    try:
+        # Convert video to H.264
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        if temp_out.exists() and temp_out.stat().st_size > 0:
+            path.unlink()
+            shutil.move(str(temp_out), str(path))
+    except Exception as e:
+        if temp_out.exists():
+            try:
+                temp_out.unlink()
+            except Exception:
+                pass
+        print(f"Failed to convert video {file_path} to H.264: {e}")
+
 # ──────────────────────────────────────────────
 # SESSION STATES
 # ──────────────────────────────────────────────
+today_str = datetime.datetime.now().strftime("%Y%m%d")
+fixed_temp_dir = str(Path(__file__).resolve().parent / f"temp_{today_str}")
+if not os.path.exists(fixed_temp_dir):
+    os.makedirs(fixed_temp_dir, exist_ok=True)
+
 defaults = {
     "input_path": None, "det_path": None,
     "detections": [], "all_track_ids": [], "preview": None,
+    "first_frame_faces": [],
     "keep_ids": set(), "output_path": None,
-    "work_dir": tempfile.mkdtemp(prefix="face_anon_modular_"),
+    "work_dir": fixed_temp_dir,
     "ref_path": None, "ref_preview": None,
     "custom_sticker_path": None, "custom_sticker_preview": None
 }
@@ -281,212 +326,188 @@ st.markdown('<div class="title-gradient">🎭 Face Anonymizer Studio (Modular)</
 st.markdown('<div class="subtitle-text">리팩토링된 모듈식 얼굴 비식별화 및 크리에이터 보호를 위한 하이브리드 파이프라인</div>', unsafe_allow_html=True)
 
 # ──────────────────────────────────────────────
-# TABBED NAVIGATION
+# ANONYMIZER STUDIO (PLAYGROUND)
 # ──────────────────────────────────────────────
-tab_pitch, tab_studio = st.tabs(["📊 Project Pitch & Story", "🎮 Anonymizer Studio"])
+col_left, col_right = st.columns([1, 1], gap="large")
 
-# ──────────────────────────────────────────────
-# TAB 1: PROJECT PITCH & STORYBOARD
-# ──────────────────────────────────────────────
-with tab_pitch:
-    col1, col2 = st.columns([3, 2], gap="large")
+with col_left:
+    st.markdown("### 📤 미디어 업로드")
     
-    with col1:
-        st.markdown(f"""
-        <div class="pitch-card">
-            <div class="pitch-header">💡 프로젝트 기획 배경 및 동기</div>
-            <p style="color: #94a3b8; line-height: 1.7; font-size: 1.05rem;">
-                최근 유튜브 브이로그(Vlog), 인스타그램 릴스(Reels), 틱톡 등 1인 미디어 창작자가 기하급수적으로 늘어나고 있습니다. 
-                이러한 영상들은 주로 길거리, 카페 등 공공장소에서 촬영되는데, 이때 <b>제3자(행인)의 얼굴이 무단으로 노출되는 초상권 침해 문제</b>가 심각하게 대두되고 있습니다.
-            </p>
-        </div>
-        
-        <div class="pitch-card">
-            <div class="pitch-header">⚠️ 창작자들의 가장 큰 페인 포인트(Pain Point)</div>
-            <ul style="color: #cbd5e1; line-height: 1.8; font-size: 1.0rem;">
-                <li><b>수작업의 한계</b>: 수많은 프레임 속 스쳐가는 사람들의 얼굴을 일일이 추적하여 모자이크 처리하는 데 엄청난 편집 시간과 피로도가 소요됩니다.</li>
-                <li><b>자기 파괴적 편집</b>: 그렇다고 전체 필터를 입히거나 화면을 다 가려버리면 영상 본연의 현장감과 미적 퀄리티가 크게 떨어지게 됩니다.</li>
-                <li><b>선택적 비식별화 니즈</b>: <b>"크리에이터 본인의 얼굴은 선명하게 살리되, 뒤 배경의 일반인 얼굴들만 깔끔하게 비식별화"</b>하는 솔루션이 부재했습니다.</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with col2:
-        st.markdown(f"""
-        <div class="pitch-card" style="height: 100%;">
-            <div class="pitch-header">⚡ 하이브리드 파이프라인 솔루션 (Hybrid Pipeline)</div>
-            <p style="color: #94a3b8; line-height: 1.7; font-size: 1.0rem;">
-                본 프로젝트는 미디어의 특성(사진 vs. 동영상)에 따른 연산량 및 프레임 간 일관성 문제를 고려하여 차별화된 하이브리드 처리 구조를 제안합니다.
-            </p>
-            <table class="comp-table">
-                <thead>
-                    <tr>
-                        <th>구분</th>
-                        <th>사진 (Image)</th>
-                        <th>동영상 (Video)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <tr>
-                        <td><b>사용 기법</b></td>
-                        <td><span class="badge badge-diffusion">Generative Diffusion</span></td>
-                        <td><span class="badge badge-blur">Blur / Sticker / 3D Mesh</span></td>
-                    </tr>
-                    <tr>
-                        <td><b>주요 장점</b></td>
-                        <td>초고품질, 자연스러운 가상 얼굴 대체</td>
-                        <td>초고속 (100+ FPS), 일관성 유지, 가벼움</td>
-                    </tr>
-                    <tr>
-                        <td><b>연산 장치</b></td>
-                        <td>GPU 권장 (SDXL Inpainting)</td>
-                        <td>CPU 전용 연산 지원 (실시간 처리 가능)</td>
-                    </tr>
-                    <tr>
-                        <td><b>주요 특징</b></td>
-                        <td>새로운 외모로 완전히 가상화</td>
-                        <td>이모지, 스티커, 또는 3D 마스크로 현장감 보존</td>
-                    </tr>
-                </tbody>
-            </table>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ──────────────────────────────────────────────
-# TAB 2: ANONYMIZER STUDIO (PLAYGROUND)
-# ──────────────────────────────────────────────
-with tab_studio:
-    col_left, col_right = st.columns([1, 1], gap="large")
+    media_type = st.radio("미디어 분류", ["사진 (Image)", "동영상 (Video)"], horizontal=True)
     
-    with col_left:
-        st.markdown("### 📤 미디어 업로드")
+    if media_type == "사진 (Image)":
+        accept_types = ["jpg", "jpeg", "png", "webp", "bmp"]
+    else:
+        accept_types = ["mp4", "mov", "avi", "mkv", "webm"]
         
-        media_type = st.radio("미디어 분류", ["사진 (Image)", "동영상 (Video)"], horizontal=True)
+    media_file = st.file_uploader(
+        f"원본 {media_type} 파일 선택",
+        type=accept_types,
+        key="studio_media_uploader"
+    )
+    
+    if media_file:
+        p = WORK / media_file.name
+        p.write_bytes(media_file.getbuffer())
         
-        if media_type == "사진 (Image)":
-            accept_types = ["jpg", "jpeg", "png", "webp", "bmp"]
+        if st.session_state.input_path != str(p):
+            st.session_state.input_path = str(p)
+            st.session_state.det_path = None
+            st.session_state.detections = []
+            st.session_state.all_track_ids = []
+            st.session_state.preview = None
+            st.session_state.output_path = None
+        
+        ext = p.suffix.lower()
+        if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+            if st.session_state.preview is None:
+                st.session_state.preview = get_first_frame(str(p))
+            st.video(str(p))
         else:
-            accept_types = ["mp4", "mov", "avi", "mkv", "webm"]
+            if st.session_state.preview is None:
+                st.session_state.preview = Image.open(p).convert("RGB")
+            st.image(st.session_state.preview, use_container_width=True)
             
-        media_file = st.file_uploader(
-            f"원본 {media_type} 파일 선택",
-            type=accept_types,
-            key="studio_media_uploader"
-        )
-        
-        if media_file:
-            p = WORK / media_file.name
-            p.write_bytes(media_file.getbuffer())
-            
-            if st.session_state.input_path != str(p):
-                st.session_state.input_path = str(p)
-                st.session_state.det_path = None
-                st.session_state.detections = []
-                st.session_state.all_track_ids = []
-                st.session_state.preview = None
-                st.session_state.output_path = None
-            
-            ext = p.suffix.lower()
-            if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
-                if st.session_state.preview is None:
-                    st.session_state.preview = get_first_frame(str(p))
-                st.video(str(p))
-            else:
-                if st.session_state.preview is None:
-                    st.session_state.preview = Image.open(p).convert("RGB")
-                st.image(st.session_state.preview, use_container_width=True)
-                
-        # 3. YOLO 얼굴 검출 작동 (Direct Call)
-        if st.session_state.input_path and not st.session_state.det_path:
-            with st.spinner("🤖 YOLO 기반 객체 탐지 및 얼굴 추적(Tracking) 수행 중..."):
-                try:
-                    # Resolve YOLO model path relative to project
+    # 3. YOLO 얼굴 검출 작동 (Direct Call)
+    if st.session_state.input_path and not st.session_state.det_path:
+        with st.spinner("🤖 YOLO 기반 객체 탐지 및 얼굴 추적(Tracking) 수행 중..."):
+            try:
+                # Prioritize YOLOv8-face Large (l) for high precision, fallback to Nano (n)
+                yolo_model = project_root / "face_yolov8l.pt"
+                if not yolo_model.exists():
+                    yolo_model = project_root / "yolov8l-face.pt"
+                if not yolo_model.exists():
                     yolo_model = project_root / "face_yolov8n.pt"
+                if not yolo_model.exists():
+                    yolo_model = project_root / "yolo_blur" / "yolo_11_L" / "best.pt"
                     if not yolo_model.exists():
                         yolo_model = project_root / "yolo11l.pt"
+                    
+                # Call modular run_tracking directly
+                normalized = run_tracking(st.session_state.input_path, model_path=yolo_model)
+                
+                p = WORK / "auto_detections.json"
+                p.write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
+                st.session_state.det_path = str(p)
+                
+                with st.spinner("🔍 InsightFace 교차 검증 중 (오탐 필터링)..."):
+                    validation_results = crop_and_validate_faces(
+                        input_path=st.session_state.input_path,
+                        detections=normalized,
+                        output_dir=WORK / "extracted_faces",
+                        cross_validate=True
+                    )
+                    
+                unique_faces = []
+                for tid, meta in validation_results.get("faces", {}).items():
+                    unique_faces.append({
+                        "track_id": str(tid),
+                        "crop_path": meta["crop_path"]
+                    })
+                    
+                st.session_state.detections = unique_faces
+                st.session_state.first_frame_faces = parse_detections(normalized)
+                st.session_state.all_track_ids = extract_all_track_ids(normalized)
+                st.rerun()
+            except Exception as e:
+                st.error(f"얼굴 검출 중 오류 발생: {e}")
+                
+    # 4. 검출된 얼굴 리스트 & 보호 ID 설정
+    dets = st.session_state.detections
+    preview = st.session_state.preview
+    
+    if dets and st.session_state.det_path:
+        st.divider()
+        st.markdown("### 🔍 탐지된 인물 분석 및 보호 대상 지정")
+        st.markdown("이 영상/사진 속에서 **비식별화하지 않고 그대로 보호할 인물(크리에이터 본인)**을 선택하세요.")
+        
+        # Crop 갤러리 그리드 표시
+        COLS = 5
+        rows = [dets[i:i+COLS] for i in range(0, len(dets), COLS)]
+        for row in rows:
+            cols = st.columns(len(row))
+            for col, face in zip(cols, row):
+                tid = face.get("track_id")
+                crop_path = face.get("crop_path")
+                with col:
+                    if crop_path and os.path.exists(crop_path):
+                        try:
+                            img = Image.open(crop_path).convert("RGB")
+                            st.image(img, use_container_width=True)
+                        except Exception:
+                            pass
                         
-                    # Call modular run_tracking directly
-                    normalized = run_tracking(st.session_state.input_path, model_path=yolo_model)
-                    
-                    p = WORK / "auto_detections.json"
-                    p.write_text(json.dumps(normalized, indent=2, ensure_ascii=False), encoding="utf-8")
-                    st.session_state.det_path = str(p)
-                    st.session_state.detections = parse_detections(normalized)
-                    st.session_state.all_track_ids = extract_all_track_ids(normalized)
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"얼굴 검출 중 오류 발생: {e}")
-                    
-        # 4. 검출된 얼굴 리스트 & 보호 ID 설정
-        dets = st.session_state.detections
-        preview = st.session_state.preview
-        
-        if dets and preview:
-            st.divider()
-            st.markdown("### 🔍 탐지된 인물 분석 및 보호 대상 지정")
-            st.markdown("이 영상/사진 속에서 **비식별화하지 않고 그대로 보호할 인물(크리에이터 본인)**을 선택하세요.")
-            
-            # Crop 갤러리 그리드 표시
-            COLS = 5
-            rows = [dets[i:i+COLS] for i in range(0, len(dets), COLS)]
-            for row in rows:
-                cols = st.columns(len(row))
-                for col, face in zip(cols, row):
-                    tid = get_track_id(face)
-                    bbox = get_bbox(face)
-                    with col:
-                        if bbox:
-                            try:
-                                img = crop_face(preview, bbox)
-                                st.image(img, use_container_width=True)
-                            except Exception:
-                                pass
-                            
-                            is_protected = tid in st.session_state.keep_ids
+                        is_protected = tid in st.session_state.keep_ids
+                        btn_label = f"🛡️ ID {tid} (보호됨)" if is_protected else f"🎭 ID {tid} (비식별 대상)"
+                        if st.button(btn_label, key=f"toggle_face_{tid}", use_container_width=True):
                             if is_protected:
-                                st.markdown(f"<p style='text-align:center;color:#2ecc71;font-weight:bold;margin:2px;font-size:13px'>🛡️ ID {tid} (보호됨)</p>", unsafe_allow_html=True)
+                                st.session_state.keep_ids.discard(tid)
                             else:
-                                st.markdown(f"<p style='text-align:center;color:#e74c3c;font-weight:bold;margin:2px;font-size:13px'>🎭 ID {tid} (대상)</p>", unsafe_allow_html=True)
-                                
-            # ID 입력 필드
-            all_ids_str = ", ".join(st.session_state.all_track_ids)
-            st.caption(f"검출된 모든 인물 Face ID 목록: **{all_ids_str}**")
-            
-            keep_input = st.text_input(
-                "보호할(원본 유지할) ID 번호 입력 (쉼표 구분)",
-                value=",".join(sorted(st.session_state.keep_ids)),
-                placeholder="예: 1, 3"
-            )
-            
-            col_k1, col_k2 = st.columns(2)
-            with col_k1:
-                if st.button("💾 적용하기", key="btn_apply_keep_ids"):
-                    st.session_state.keep_ids = {x.strip() for x in keep_input.split(",") if x.strip()}
-                    st.rerun()
-            with col_k2:
-                if st.button("🎭 전체 비식별화", key="btn_clear_keep_ids"):
-                    st.session_state.keep_ids = set()
-                    st.rerun()
-                    
-            # 5. 상태 시각화 박스 오버레이 그리기
-            st.image(draw_bboxes(preview, dets, st.session_state.keep_ids),
-                     caption="초록색(🛡️)=보호 대상, 빨간색(🎭)=비식별화 진행 대상", use_container_width=True)
-
-    with col_right:
-        st.markdown("### ⚙️ 비식별화 설정")
+                                st.session_state.keep_ids.add(tid)
+                            st.rerun()
+                            
+        # ID 입력 필드
+        all_ids_str = ", ".join(st.session_state.all_track_ids)
+        st.caption(f"검출된 모든 인물 Face ID 목록: **{all_ids_str}**")
         
-        # 1. 처리 방식 선택
-        if media_type == "사진 (Image)":
-            method = st.selectbox("아노니마이징 기법", ["블러 / 픽셀화", "스티커 이미지 붙이기", "Generative Diffusion (AI 생성)"])
-        else:
-            method = st.selectbox("아노니마이징 기법", ["블러 / 픽셀화", "스티커 이미지 붙이기", "3D Helmet Overlay (3D 헬멧 씌우기)", "Generative Diffusion (AI 생성)"])
+        keep_input = st.text_input(
+            "보호할(원본 유지할) ID 번호 입력 (쉼표 구분)",
+            value=",".join(sorted(st.session_state.keep_ids)),
+            placeholder="예: 1, 3"
+        )
+        
+        col_k1, col_k2 = st.columns(2)
+        with col_k1:
+            if st.button("💾 적용하기", key="btn_apply_keep_ids"):
+                st.session_state.keep_ids = {x.strip() for x in keep_input.split(",") if x.strip()}
+                st.rerun()
+        with col_k2:
+            if st.button("🎭 전체 비식별화", key="btn_clear_keep_ids"):
+                st.session_state.keep_ids = set()
+                st.rerun()
+                
+
+
+with col_right:
+    st.markdown("### ⚙️ 비식별화 설정")
+    
+    # 1. 처리 방식 선택
+    if media_type == "사진 (Image)":
+        method = st.selectbox("아노니마이징 기법", ["블러 / 픽셀화", "스티커 이미지 붙이기", "Generative Diffusion (AI 생성)"])
+    else:
+        method = st.selectbox("아노니마이징 기법", ["블러 / 픽셀화", "스티커 이미지 붙이기", "3D Asset Overlay (3D 에셋 씌우기)"])
+        
+    # 2. 기법별 세부 옵션들
+    if method == "Generative Diffusion (AI 생성)":
+        st.warning("⚠️ 디퓨전 생성 기법은 높은 연산량을 필요로 하므로 작동 시 수 분의 시간이 걸릴 수 있습니다. (GPU 환경 권장)")
+        
+        diffusion_style_mode = st.radio(
+            "디퓨전 스타일 선택", 
+            ["기본 프리셋 스타일 적용 (Panda, Robot 등)", "레퍼런스 이미지 직접 지정 (InstantID)", "텍스트 프롬프트 직접 입력"],
+            key="diff_style_mode_radio"
+        )
+        
+        selected_style_preset = None
+        custom_prompt = None
+        custom_negative_prompt = None
+        ref_mode = "레퍼런스 이미지 사용 (InstantID / IP-Adapter)"
+        
+        if diffusion_style_mode == "기본 프리셋 스타일 적용 (Panda, Robot 등)":
+            preset_label = st.selectbox(
+                "적용할 프리셋 스타일", 
+                ["2D Animation (2D 애니메이션화)", "Panda Bear Mask (판다 가면)", "Chrome Robot Face (로봇 얼굴)", "Futuristic Motorcycle Helmet (오토바이 헬멧)", "Mysterious Dark Hood (어두운 후드)", "Plain Cardboard Box (상자 가면)"]
+            )
+            preset_map = {
+                "2D Animation (2D 애니메이션화)": "2d_animation",
+                "Panda Bear Mask (판다 가면)": "animal_mask",
+                "Chrome Robot Face (로봇 얼굴)": "robot_mask",
+                "Futuristic Motorcycle Helmet (오토바이 헬멧)": "helmet",
+                "Mysterious Dark Hood (어두운 후드)": "hood",
+                "Plain Cardboard Box (상자 가면)": "cardboard_box"
+            }
+            selected_style_preset = preset_map[preset_label]
             
-        # 2. 기법별 세부 옵션들
-        if method == "Generative Diffusion (AI 생성)":
-            st.warning("⚠️ 디퓨전 생성 기법은 높은 연산량을 필요로 하므로 작동 시 수 분의 시간이 걸릴 수 있습니다. (GPU 환경 권장)")
-            
-            diff_mode = st.selectbox("레퍼런스 스타일 방식", ["얼굴 합성 (Face Blend)", "아이덴티티 보존 (InstantID/IP-Adapter)", "프롬프트 추출 (Prompt Only)"])
-            
+        elif diffusion_style_mode == "레퍼런스 이미지 직접 지정 (InstantID)":
             ref_uploader = st.file_uploader(
                 "스타일 대체의 기준이 될 레퍼런스 얼굴 사진 (선택)",
                 type=["jpg", "jpeg", "png", "webp"],
@@ -499,171 +520,227 @@ with tab_studio:
                 st.session_state.ref_preview = Image.open(ref_p).convert("RGB")
                 st.image(st.session_state.ref_preview, caption="등록된 레퍼런스 스타일", width=200)
                 
-            inpaint_scope = st.selectbox("생성 경계 범위", ["face-crop", "full-frame"])
-            mask_mode = st.selectbox("마스크 따기 방식", ["sam", "ellipse", "bbox", "auto"])
-            seed = st.number_input("재현성 시드(Seed)", value=1234, min_value=0)
-            max_frames = st.number_input("최대 처리 프레임 (0 = 전체)", value=15, min_value=0)
+        else: # 텍스트 프롬프트 직접 입력
+            custom_prompt = st.text_area(
+                "긍정 프롬프트 (Positive Prompt)", 
+                value="photorealistic face of a synthetic non-famous person, natural skin texture, realistic eyes"
+            )
+            custom_negative_prompt = st.text_area(
+                "부정 프롬프트 (Negative Prompt)", 
+                value="celebrity, famous person, same identity, cartoon, anime, 3d render, deformed face, blurry"
+            )
             
-        elif method == "스티커 이미지 붙이기":
-            sticker_type = st.radio("스티커 종류", ["기본 탑재 이미지 스티커", "이모지 문자 입력", "커스텀 스티커 이미지 업로드"])
-            
-            emoji_char = "🐼"
-            custom_sticker_path = None
-            
-            if sticker_type == "기본 탑재 이미지 스티커":
-                default_sticker_select = st.selectbox("기본 스티커 선택", ["Panda Mask (판다 가면)", "Helmet Mask (헬멧)"])
-                if default_sticker_select == "Panda Mask (판다 가면)":
-                    custom_sticker_path = "panda.png"
-                else:
-                    custom_sticker_path = "helmet_ref.png"
-                    
-            elif sticker_type == "이모지 문자 입력":
-                emoji_char = st.text_input("사용할 이모지 문자력", value="🐼")
-                
-            else:
-                custom_uploader = st.file_uploader(
-                    "커스텀 투명 배경(PNG) 스티커 업로드",
-                    type=["png"],
-                    key="studio_custom_sticker_uploader"
-                )
-                if custom_uploader:
-                    st_p = WORK / custom_uploader.name
-                    st_p.write_bytes(custom_uploader.getbuffer())
-                    st.session_state.custom_sticker_path = str(st_p)
-                    st.session_state.custom_sticker_preview = Image.open(st_p).convert("RGBA")
-                    st.image(st.session_state.custom_sticker_preview, caption="업로드한 커스텀 스티커", width=120)
-                    custom_sticker_path = st.session_state.custom_sticker_path
-            
-            max_frames = st.number_input("최대 처리 프레임 (0 = 전체)", value=0, min_value=0)
-            
-        elif method == "3D Helmet Overlay (3D 헬멧 씌우기)":
-            st.info("🏍️ YOLO tracking 바운딩박스 + InsightFace Pose(회전 각도) 데이터를 추출해 자연스러운 3D 헬멧 오버레이를 진행합니다.")
-            
-            helmet_scale = st.slider("헬멧 크기 배율 (Helmet Scale)", min_value=0.5, max_value=2.0, value=1.35, step=0.05)
-            y_shift = st.slider("세로 오프셋 (Y-Shift, 음수=위로)", min_value=-0.5, max_value=0.5, value=-0.15, step=0.01)
-            z_shift = st.slider("가로/깊이 오프셋 (Z-Shift, 음수=뒤로)", min_value=-15.0, max_value=0.0, value=-6.0, step=0.5)
-            
-            with st.expander("⭐ 플리커링(떨림) 스무딩 & Fallback 옵션"):
-                size_deadband = st.slider("크기 변화 데드밴드 (Size Deadband)", min_value=0.0, max_value=0.20, value=0.08, step=0.01)
-                pos_deadband = st.slider("위치 변화 데드밴드 (Position Deadband)", min_value=0.0, max_value=0.10, value=0.04, step=0.01)
-                ema_size = st.slider("크기 스무딩 (EMA size, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.30, step=0.05)
-                ema_pos = st.slider("위치 스무딩 (EMA position, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.30, step=0.05)
-                ema_pose = st.slider("각도 스무딩 (EMA pose, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.25, step=0.05)
-                fallback_ttl = st.number_input("얼굴 소실 시 마지막 포즈 유지 프레임 수 (TTL)", min_value=0, max_value=60, value=15)
-                
-            max_frames = 0
-            
-        else: # Blur / Pixelate
-            blur_style = st.selectbox("블러 방식", ["Gaussian Blur (흐리게)", "Pixelate (모자이크)"])
-            blur_radius = st.slider("블러 강도 (Radius)", min_value=1.0, max_value=50.0, value=18.0, step=1.0)
-            pixel_size = st.slider("픽셀 크기 (모자이크 크기)", min_value=2, max_value=32, value=8, step=1)
-            max_frames = st.number_input("최대 처리 프레임 (0 = 전체)", value=0, min_value=0)
-            
-        st.divider()
+        inpaint_scope = "face-crop"
+        mask_mode = "sam"
+        seed = st.number_input("재현성 시드(Seed)", value=1234, min_value=0)
+        max_frames = 0
         
-        # 3. 비식별화 실행 버튼 (Direct module calls)
-        ready = st.session_state.input_path and st.session_state.det_path
-        if not ready:
-            st.info("왼쪽 화면에서 원본 파일을 업로드하고 얼굴 검출이 완료되면 실행 버튼이 활성화됩니다.")
-        else:
-            if st.button("🚀 비식별화 파이프라인 구동 시작", type="primary", use_container_width=True):
-                inp = st.session_state.input_path
-                out = str(WORK / (Path(inp).stem + "_anonymized" + Path(inp).suffix))
-                st.session_state.output_path = out
-                
-                with st.spinner("비식별화 가공 작업이 열심히 실행 중입니다..."):
-                    try:
-                        if method == "블러 / 픽셀화":
-                            run_mode = "blur" if blur_style == "Gaussian Blur (흐리게)" else "pixelate"
-                            apply_blur_anonymization(
-                                input_path=inp,
-                                output_path=out,
-                                detections=st.session_state.det_path,
-                                keep_track_ids=st.session_state.keep_ids,
-                                fallback_mode=run_mode,
-                                fallback_blur_radius=blur_radius,
-                                fallback_pixel_size=pixel_size,
-                                max_frames=max_frames
-                            )
-                        elif method == "스티커 이미지 붙이기":
-                            apply_sticker_anonymization(
-                                input_path=inp,
-                                output_path=out,
-                                detections=st.session_state.det_path,
-                                keep_track_ids=st.session_state.keep_ids,
-                                emoji_char=emoji_char,
-                                sticker_png_path=custom_sticker_path,
-                                max_frames=max_frames
-                            )
-                        elif method == "3D Helmet Overlay (3D 헬멧 씌우기)":
-                            apply_3d_anonymization(
-                                input_path=inp,
-                                output_path=out,
-                                detections=st.session_state.det_path,
-                                keep_track_ids=st.session_state.keep_ids,
-                                helmet_scale=helmet_scale,
-                                y_shift=y_shift,
-                                z_shift=z_shift,
-                                size_deadband=size_deadband,
-                                pos_deadband=pos_deadband,
-                                ema_size=ema_size,
-                                ema_pos=ema_pos,
-                                ema_pose=ema_pose,
-                                fallback_ttl=fallback_ttl
-                            )
-                        else: # Generative Diffusion
-                            apply_diffusion_anonymization(
-                                input_path=inp,
-                                output_path=out,
-                                detections=st.session_state.det_path,
-                                keep_track_ids=st.session_state.keep_ids,
-                                fallback_mode="blur",
-                                seed=int(seed),
-                                mask_mode=mask_mode,
-                                inpaint_scope=inpaint_scope,
-                                ref_path=st.session_state.get("ref_path"),
-                                ref_mode=diff_mode,
-                                max_frames=int(max_frames)
-                            )
-                        st.success("🎉 비식별화 처리가 완료되었습니다!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ 처리 중 에러 발생: {e}")
-                        
-        # 4. 결과 출력
-        out_path = st.session_state.get("output_path")
-        if out_path and Path(out_path).exists():
-            st.markdown("---")
-            st.markdown("### 📦 최종 처리 결과 비교")
-            
-            is_video = Path(out_path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
-            
-            if is_video:
-                st.video(out_path)
-                
-                if preview:
-                    res_frame = get_first_frame(out_path)
-                    if res_frame:
-                        res_col1, res_col2 = st.columns(2)
-                        with res_col1:
-                            st.image(preview, caption="원본 (첫 프레임)", use_container_width=True)
-                        with res_col2:
-                            st.image(res_frame, caption="비식별화 결과 (첫 프레임)", use_container_width=True)
+        # LoRA parameters default (resolved automatically by style preset)
+        lora_path = None
+        lora_weight = 0.8
+        
+    elif method == "스티커 이미지 붙이기":
+        sticker_type = st.radio("스티커 종류", ["기본 탑재 이미지 스티커", "이모지 문자 입력", "커스텀 스티커 이미지 업로드"])
+        
+        emoji_char = "🐼"
+        custom_sticker_path = None
+        
+        if sticker_type == "기본 탑재 이미지 스티커":
+            default_sticker_select = st.selectbox("기본 스티커 선택", ["Panda Mask (판다 가면)", "Helmet Mask (헬멧)"])
+            if default_sticker_select == "Panda Mask (판다 가면)":
+                custom_sticker_path = "panda.png"
             else:
-                result_img = Image.open(out_path)
-                res_col1, res_col2 = st.columns(2)
-                if preview:
-                    with res_col1:
-                        st.image(preview, caption="원본 사진", use_container_width=True)
-                    with res_col2:
-                        st.image(result_img, caption="비식별화 가공 사진", use_container_width=True)
-                else:
-                    st.image(result_img, caption="비식별화 가공 사진", use_container_width=True)
+                custom_sticker_path = "helmet_ref.png"
+                
+        elif sticker_type == "이모지 문자 입력":
+            emoji_char = st.text_input("사용할 이모지 문자력", value="🐼")
+            
+        else:
+            custom_uploader = st.file_uploader(
+                "커스텀 투명 배경(PNG) 스티커 업로드",
+                type=["png"],
+                key="studio_custom_sticker_uploader"
+            )
+            if custom_uploader:
+                st_p = WORK / custom_uploader.name
+                st_p.write_bytes(custom_uploader.getbuffer())
+                st.session_state.custom_sticker_path = str(st_p)
+                st.session_state.custom_sticker_preview = Image.open(st_p).convert("RGBA")
+                st.image(st.session_state.custom_sticker_preview, caption="업로드한 커스텀 스티커", width=120)
+                custom_sticker_path = st.session_state.custom_sticker_path
+                
+        with st.expander("⭐ 스티커 크기 및 적용 옵션"):
+            sticker_min_face_size = st.slider(
+                "최소 얼굴 크기 (픽셀)", 
+                min_value=0, max_value=100, value=40, step=5,
+                help="이 크기보다 작은 얼굴은 스티커 대신 모자이크 처리됩니다. 항상 스티커를 적용하려면 0으로 낮추세요."
+            )
+        max_frames = 0
+        
+    elif method == "3D Asset Overlay (3D 에셋 씌우기)":
+        st.info("🏍️ YOLO tracking 바운딩박스 + InsightFace Pose(회전 각도) 데이터를 추출해 자연스러운 3D 에셋 오버레이를 진행합니다.")
+        
+        # Object settings: Helmet, Mask, OBJ upload
+        asset_type = st.selectbox("3D 에셋 종류 (Object)", ["Helmet (헬멧)", "Mask (가면)", "OBJ 파일 직접 업로드"])
+        
+        custom_obj_path = None
+        if asset_type == "OBJ 파일 직접 업로드":
+            uploaded_obj = st.file_uploader("OBJ 파일 업로드 (.obj)", type=["obj"], key="custom_3d_obj_uploader")
+            if uploaded_obj:
+                obj_p = WORK / uploaded_obj.name
+                obj_p.write_bytes(uploaded_obj.getbuffer())
+                custom_obj_path = str(obj_p)
+                st.success(f"✔️ {uploaded_obj.name} 파일 업로드 완료!")
+        elif asset_type == "Mask (가면)":
+            st.warning("⚠️ 가면(Mask) 3D 모델 (.obj) 파일이 로컬 폴더에 존재하지 않아, 데모 실행 시 기본 헬멧 모델로 대체 적용됩니다.")
+        
+        # Select base OBJ path to pass
+        curr_dir = Path(__file__).resolve().parent
+        base_helmet_path = curr_dir / "object3d" / "assets" / "10517_Motorcycle_Helmet_v01_L3.obj"
+        if not base_helmet_path.exists():
+            base_helmet_path = project_root / "helmet" / "10517_Motorcycle_Helmet_v01_L3.obj"
+            
+        if asset_type == "OBJ 파일 직접 업로드" and custom_obj_path:
+            selected_obj_path = custom_obj_path
+        else:
+            selected_obj_path = str(base_helmet_path)
+            
+        helmet_scale = st.slider("에셋 크기 배율 (Scale)", min_value=0.5, max_value=2.0, value=1.35, step=0.05)
+        y_shift = st.slider("세로 오프셋 (Y-Shift, 음수=위로)", min_value=-0.5, max_value=0.5, value=-0.15, step=0.01)
+        z_shift = st.slider("가로/깊이 오프셋 (Z-Shift, 음수=뒤로)", min_value=-15.0, max_value=0.0, value=-6.0, step=0.5)
+        
+        with st.expander("⭐ 플리커링(떨림) 스무딩 & Fallback 옵션"):
+            size_deadband = st.slider("크기 변화 데드밴드 (Size Deadband)", min_value=0.0, max_value=0.20, value=0.08, step=0.01)
+            pos_deadband = st.slider("위치 변화 데드밴드 (Position Deadband)", min_value=0.0, max_value=0.10, value=0.04, step=0.01)
+            ema_size = st.slider("크기 스무딩 (EMA size, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.30, step=0.05)
+            ema_pos = st.slider("위치 스무딩 (EMA position, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.30, step=0.05)
+            ema_pose = st.slider("각도 스무딩 (EMA pose, 작을수록 부드러움)", min_value=0.05, max_value=1.0, value=0.25, step=0.05)
+            fallback_ttl = st.number_input("얼굴 소실 시 마지막 포즈 유지 프레임 수 (TTL)", min_value=0, max_value=60, value=15)
+            
+        max_frames = 0
+        
+    else: # Blur / Pixelate
+        blur_style = st.selectbox("블러 방식", ["Gaussian Blur (흐리게)", "Pixelate (모자이크)"])
+        blur_radius = st.slider("블러 강도 (Radius)", min_value=1.0, max_value=50.0, value=18.0, step=1.0)
+        pixel_size = st.slider("픽셀 크기 (모자이크 크기)", min_value=2, max_value=32, value=8, step=1)
+        max_frames = 0
+        
+    st.divider()
+    
+    # 3. 비식별화 실행 버튼 (Direct module calls)
+    ready = st.session_state.input_path and st.session_state.det_path
+    if not ready:
+        st.info("왼쪽 화면에서 원본 파일을 업로드하고 얼굴 검출이 완료되면 실행 버튼이 활성화됩니다.")
+    else:
+        if st.button("🚀 비식별화 파이프라인 구동 시작", type="primary", use_container_width=True):
+            inp = st.session_state.input_path
+            out = str(WORK / (Path(inp).stem + "_anonymized" + Path(inp).suffix))
+            st.session_state.output_path = out
+            
+            with st.spinner("비식별화 가공 작업이 열심히 실행 중입니다..."):
+                try:
+                    if method == "블러 / 픽셀화":
+                        run_mode = "blur" if blur_style == "Gaussian Blur (흐리게)" else "pixelate"
+                        apply_blur_anonymization(
+                            input_path=inp,
+                            output_path=out,
+                            detections=st.session_state.det_path,
+                            keep_track_ids=st.session_state.keep_ids,
+                            fallback_mode=run_mode,
+                            fallback_blur_radius=blur_radius,
+                            fallback_pixel_size=pixel_size,
+                            max_frames=max_frames
+                        )
+                    elif method == "스티커 이미지 붙이기":
+                        apply_sticker_anonymization(
+                            input_path=inp,
+                            output_path=out,
+                            detections=st.session_state.det_path,
+                            keep_track_ids=st.session_state.keep_ids,
+                            emoji_char=emoji_char,
+                            sticker_png_path=custom_sticker_path,
+                            min_face_size=sticker_min_face_size,
+                            max_frames=max_frames
+                        )
+                    elif method == "3D Asset Overlay (3D 에셋 씌우기)":
+                        apply_3d_anonymization(
+                            input_path=inp,
+                            output_path=out,
+                            detections=st.session_state.det_path,
+                            keep_track_ids=st.session_state.keep_ids,
+                            obj_path=selected_obj_path,
+                            helmet_scale=helmet_scale,
+                            y_shift=y_shift,
+                            z_shift=z_shift,
+                            size_deadband=size_deadband,
+                            pos_deadband=pos_deadband,
+                            ema_size=ema_size,
+                            ema_pos=ema_pos,
+                            ema_pose=ema_pose,
+                            fallback_ttl=fallback_ttl
+                        )
+                    else: # Generative Diffusion
+                        current_ref_path = st.session_state.get("ref_path") if diffusion_style_mode == "레퍼런스 이미지 직접 지정 (InstantID)" else None
+                        apply_diffusion_anonymization(
+                            input_path=inp,
+                            output_path=out,
+                            detections=st.session_path if hasattr(st, "session_path") else st.session_state.det_path,
+                            keep_track_ids=st.session_state.keep_ids,
+                            fallback_mode="blur",
+                            seed=int(seed),
+                            mask_mode=mask_mode,
+                            inpaint_scope=inpaint_scope,
+                            ref_path=current_ref_path,
+                            ref_mode=ref_mode,
+                            max_frames=int(max_frames),
+                            style_preset=selected_style_preset,
+                            custom_prompt=custom_prompt,
+                            custom_negative_prompt=custom_negative_prompt,
+                            lora_path=lora_path,
+                            lora_weight=lora_weight
+                        )
+                    # Convert to browser-playable H.264 video format
+                    with st.spinner("🎬 브라우저 재생용 비디오 인코딩 형식(H.264)으로 변환 중..."):
+                        ensure_h264_video(out)
+                    st.success("🎉 비식별화 처리가 완료되었습니다!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 처리 중 에러 발생: {e}")
                     
-            with open(out_path, "rb") as f:
-                st.download_button(
-                    "⬇️ 결과 파일 내려받기", f.read(),
-                    file_name=Path(out_path).name,
-                    mime="video/mp4" if is_video else "image/jpeg",
-                    use_container_width=True
-                )
+    # 4. 결과 출력
+    out_path = st.session_state.get("output_path")
+    if out_path and Path(out_path).exists():
+        st.markdown("---")
+        st.markdown("### 📦 최종 처리 결과 비교")
+        
+        is_video = Path(out_path).suffix.lower() in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+        
+        if is_video:
+            st.video(out_path)
+            
+            if preview:
+                res_frame = get_first_frame(out_path)
+                if res_frame:
+                    res_col1, res_col2 = st.columns(2)
+                    with res_col1:
+                        st.image(preview, caption="원본 (첫 프레임)", use_container_width=True)
+                    with res_col2:
+                        st.image(res_frame, caption="비식별화 결과 (첫 프레임)", use_container_width=True)
+        else:
+            result_img = Image.open(out_path)
+            res_col1, res_col2 = st.columns(2)
+            if preview:
+                with res_col1:
+                    st.image(preview, caption="원본 사진", use_container_width=True)
+                with res_col2:
+                    st.image(result_img, caption="비식별화 가공 사진", use_container_width=True)
+            else:
+                st.image(result_img, caption="비식별화 가공 사진", use_container_width=True)
+                
+        with open(out_path, "rb") as f:
+            st.download_button(
+                "⬇️ 결과 파일 내려받기", f.read(),
+                file_name=Path(out_path).name,
+                mime="video/mp4" if is_video else "image/jpeg",
+                use_container_width=True
+            )

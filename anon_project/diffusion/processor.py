@@ -23,7 +23,12 @@ def apply_diffusion_anonymization(
     inpaint_scope: str = "face-crop",
     ref_path: Optional[Union[str, Path]] = None,
     ref_mode: str = "Face Blend",
-    max_frames: int = 0
+    max_frames: int = 0,
+    style_preset: Optional[str] = None,
+    custom_prompt: Optional[str] = None,
+    custom_negative_prompt: Optional[str] = None,
+    lora_path: Optional[Union[str, Path]] = None,
+    lora_weight: float = 0.8
 ) -> None:
     """
     Main API to execute Diffusion / InstantID face anonymization.
@@ -71,15 +76,47 @@ def apply_diffusion_anonymization(
     if max_frames > 0:
         args_list += ["--max-frames", str(max_frames)]
         
+    if style_preset:
+        from style_presets import get_preset
+        preset = get_preset(style_preset)
+        args_list += [
+            "--prompt", preset.prompt,
+            "--negative-prompt", preset.negative_prompt + ", " + preset.privacy_negative_prompt,
+            "--controlnet", preset.controlnet,
+            "--controlnet-scale", str(preset.controlnet_scale),
+            "--ip-adapter-scale", str(preset.ip_adapter_scale),
+            "--strength", str(preset.strength),
+            "--guidance-scale", str(preset.guidance_scale),
+            "--num-inference-steps", str(preset.num_inference_steps),
+            "--mask-expansion", str(preset.mask_expansion),
+            "--mask-dilation", str(preset.mask_dilation),
+        ]
+    else:
+        if custom_prompt:
+            args_list += ["--prompt", custom_prompt]
+        if custom_negative_prompt:
+            args_list += ["--negative-prompt", custom_negative_prompt]
+            
+    # Auto-resolve LoRA if style preset is 2d_animation
+    if style_preset == "2d_animation" and not lora_path:
+        animation_lora_file = curr_dir.parent / "LoRA" / "2danimation.safetensors"
+        if animation_lora_file.exists():
+            lora_path = animation_lora_file
+
+    if lora_path and Path(lora_path).exists():
+        args_list += [
+            "--lora", str(Path(lora_path).resolve()),
+            "--lora-weight", str(lora_weight)
+        ]
+            
     if ref_path and Path(ref_path).exists():
         ref_path = str(Path(ref_path).resolve())
         if ref_mode == "얼굴 합성 (Face Blend)":
             args_list += ["--reference-face-images", ref_path]
-        elif ref_mode == "아이덴티티 보존 (InstantID/IP-Adapter)":
+        elif ref_mode in ("아이덴티티 보존 (InstantID/IP-Adapter)", "레퍼런스 이미지 사용 (InstantID / IP-Adapter)"):
             args_list += ["--reference-identity-images", ref_path]
         elif ref_mode == "프롬프트 추출 (Prompt Only)":
             args_list += ["--reference-images", ref_path]
-            
     print(f"[Diffusion Anonymizer] Running in-memory pipeline with args: {args_list[1:]}")
     
     # Store original sys.argv and sys.path

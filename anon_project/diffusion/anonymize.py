@@ -43,6 +43,69 @@ from reference_prompt import (
 )
 
 
+# Monkey patch diffusers to avoid IndexError when loading LoRAs for SDXL text encoder
+try:
+    import diffusers.loaders.lora_base
+    import diffusers.loaders.lora_pipeline
+    original_load_lora_into_text_encoder = diffusers.loaders.lora_base._load_lora_into_text_encoder
+
+    def patched_load_lora_into_text_encoder(
+        state_dict,
+        network_alphas,
+        text_encoder,
+        prefix=None,
+        lora_scale=1.0,
+        text_encoder_name="text_encoder",
+        adapter_name=None,
+        _pipeline=None,
+        low_cpu_mem_usage=False,
+        hotswap: bool = False,
+        metadata=None,
+    ):
+        new_state_dict = {}
+        prefix_to_check = f"{prefix}." if prefix is not None else ""
+        target_prefix = f"{prefix_to_check}text_model.encoder."
+        replacement_prefix = f"{prefix_to_check}encoder."
+        
+        if not hasattr(text_encoder, "text_model"):
+            for k, v in state_dict.items():
+                if k.startswith(target_prefix):
+                    new_key = k.replace(target_prefix, replacement_prefix, 1)
+                    new_state_dict[new_key] = v
+                else:
+                    new_state_dict[k] = v
+            state_dict = new_state_dict
+            
+            if network_alphas is not None:
+                new_alphas = {}
+                for k, v in network_alphas.items():
+                    if k.startswith(target_prefix):
+                        new_key = k.replace(target_prefix, replacement_prefix, 1)
+                        new_alphas[new_key] = v
+                    else:
+                        new_alphas[k] = v
+                    network_alphas = new_alphas
+
+        return original_load_lora_into_text_encoder(
+            state_dict=state_dict,
+            network_alphas=network_alphas,
+            text_encoder=text_encoder,
+            prefix=prefix,
+            lora_scale=lora_scale,
+            text_encoder_name=text_encoder_name,
+            adapter_name=adapter_name,
+            _pipeline=_pipeline,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+            hotswap=hotswap,
+            metadata=metadata,
+        )
+
+    diffusers.loaders.lora_base._load_lora_into_text_encoder = patched_load_lora_into_text_encoder
+    diffusers.loaders.lora_pipeline._load_lora_into_text_encoder = patched_load_lora_into_text_encoder
+except Exception as e:
+    warnings.warn(f"Failed to apply text encoder LoRA loading monkey patch: {e}", RuntimeWarning)
+
+
 DEFAULT_MODEL_ID = "OzzyGT/RealVisXL_V4.0_inpainting"
 FALLBACK_MODEL_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
 DEFAULT_SAM_MODEL_ID = "facebook/sam-vit-base"
@@ -2427,8 +2490,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-human-threshold", type=float, default=0.55)
     parser.add_argument("--reference-human-min-ratio", type=float, default=0.5)
     parser.add_argument("--reference-target-face-threshold", type=float, default=0.35)
+    _curr_dir = Path(__file__).resolve().parent
+    _default_ref_root = (
+        _curr_dir.parent if (_curr_dir.parent / "models").exists()
+        else (_curr_dir.parent.parent if (_curr_dir.parent.parent / "models").exists() else Path("."))
+    )
     parser.add_argument("--reference-face-model", default="antelopev2")
-    parser.add_argument("--reference-face-model-root", type=Path, default=Path("."))
+    parser.add_argument("--reference-face-model-root", type=Path, default=_default_ref_root)
     parser.add_argument(
         "--reference-face-providers",
         type=parse_csv_tuple,
